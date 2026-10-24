@@ -9,7 +9,7 @@
 | 插件源码 | 本仓库 `plugin/astrbot_plugin_feiyu_memory` |
 | 运行目录 | `<AstrBot 数据目录>/plugins/astrbot_plugin_feiyu_memory` |
 | 插件配置 | `<AstrBot 数据目录>/config/astrbot_plugin_feiyu_memory_config.json`（加载后自动生成） |
-| 记忆数据库 | 默认 `<项目根>/memory/feiyu_memory.db`，可用 `db_path` 或环境变量 `FEIYU_MEMORY_DB` 改 |
+| 记忆数据库 | 默认 `~/feiyu_memory/memory/feiyu_memory.db`，**部署时建议显式设置** `db_path` 或环境变量 `FEIYU_MEMORY_DB`／`FEIYU_PROJECT_ROOT` |
 
 运行目录里最终应有 5 个文件：`main.py`、`memory_core.py`、`metadata.yaml`、`persona_default.txt`、`_conf_schema.json`。
 
