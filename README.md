@@ -23,6 +23,13 @@
 - **降级仍认主**：检索超时只丢「旧记录召回」，核心身份与称呼照常注入。
 - **中文检索不依赖分词服务**：Python 侧 bigram + 拉丁词打分；配置了 AstrBot 的嵌入模型时叠加向量分。
 - **人格与记忆分离**：插件可注入内置人格（`persona_default.txt`），也可以关掉改用 AstrBot 里配的人格。
+- **工作状态（阶段三）**：`kind=state` 带有效期（默认 7 天），单独一段注入，到期自动归档；
+  适合「这几天在改记忆插件」这类短期上下文，不污染长期档案。
+- **关系日记（阶段三）**：每天 23:30 由真实记录生成一篇 `derived` 日记，只私聊注入；
+  源记录被忘记或纠正后，日记连带失效，不会拿过时印象当事实。
+- **后台自动提取（阶段三，默认关闭）**：每 6 轮或空闲 5 分钟后，让模型按固定 JSON 契约
+  从真实对话里提候选；代码侧校验类别、长度、置信度、证据必须能在原文逐字找到，
+  只写 `observed_dialogue`，日限 40 条，删除纪元推进后旧任务直接作废。
 
 ## 目录
 
@@ -30,10 +37,12 @@
 plugin/astrbot_plugin_feiyu_memory/   插件本体（安装时整个目录复制到 AstrBot 的 data/plugins/）
   main.py                             指令、注入、写入口
   memory_core.py                      记忆内核：表结构、权限过滤、检索、注入、备份
+  memory_stage3.py                    阶段三：自动提取、关系日记、工作状态编排
   metadata.yaml / _conf_schema.json   插件元数据与配置项
   persona_default.txt                 内置人格正文（可替换/关闭）
 tools/feiyu_memory_admin.py           本地管理 CLI（绑定、导入、查看、纠正、忘记、备份、恢复）
-tests/selftest.py                     离线自测（53 项，不需要 AstrBot、不连 QQ）
+tests/selftest.py                     离线自测（58 项，不需要 AstrBot、不连 QQ）
+tests/selftest_stage3.py              阶段三自测（49 项：队列、校验、日记、状态、派生失效）
 tests/import_check.py                 用真实 AstrBot 包做导入与签名检查
 docs/INSTALL.md                       安装与验收
 docs/USAGE.md                         使用说明（指令、隐私矩阵、备份）
@@ -69,6 +78,9 @@ docs/USAGE.md                         使用说明（指令、隐私矩阵、备
 | `/feiyu 忘记 <编号>` | 删除并写墓碑 |
 | `/feiyu 撤销` | 撤销上一条写入 |
 | `/feiyu 约定 <内容>` / `/feiyu 完成 <编号>` | 未完成约定 |
+| `/feiyu 当前 <在做什么>` | 记一条带有效期的工作状态（默认 7 天） |
+| `/feiyu 日记` / `/feiyu 写日记` | 看最近一篇 / 立即写一篇关系日记 |
+| `/feiyu 提取` | 立刻跑一次后台提取（不必等攒够 6 轮） |
 | `/feiyu 暂停` / `/feiyu 恢复` | 暂停/恢复写入 |
 
 别名：`/飞鱼记忆`、`/记忆`。主人私聊直接说「记住 ……」也会落库并回执。
@@ -96,20 +108,37 @@ docs/USAGE.md                         使用说明（指令、隐私矩阵、备
 `auto_capture_owner_private`、`owner_private_default_scope`、`group_memory_enabled`、
 `vector_search`、`auto_extract`。
 
+阶段三相关（默认值即可用）：
+
+| 键 | 默认 | 说明 |
+| --- | --- | --- |
+| `state_max_chars` / `state_ttl_days` | 200 / 7 | 工作状态注入预算与有效期 |
+| `diary_enable` / `diary_hour` / `diary_minute` | true / 23 / 30 | 关系日记开关与写入时刻 |
+| `diary_min_records` / `diary_max_chars` | 3 / 240 | 至少几条素材才写 / 注入预算 |
+| `auto_extract` | false | 后台提取总开关 |
+| `extract_batch_turns` / `extract_idle_minutes` | 6 / 5 | 攒几轮或空闲多久后提取 |
+| `extract_min_confidence` / `extract_daily_limit` | 0.7 / 40 | 置信度门槛 / 每日上限 |
+| `allow_auto_public` | false | 是否允许自动提取写公开范围 |
+| `extract_model` / `diary_model` | 空 | 留空沿用当前对话模型 |
+
 `db_path` 留空时回退到 `~/feiyu_memory/memory/feiyu_memory.db`（或环境变量
 `FEIYU_MEMORY_DB` / `FEIYU_PROJECT_ROOT`），正式部署建议显式指定一个固定路径。
 
 ## 测试
 
 ```powershell
-python tests/selftest.py          # 离线 53 项，覆盖权限、召回、纠正、忘记、备份、注入预算
+python tests/selftest.py          # 离线 58 项，覆盖权限、召回、纠正、忘记、备份、注入预算、指令回执
+python tests/selftest_stage3.py   # 阶段三 49 项：队列门槛、证据校验、日记、状态、派生失效
 python tests/import_check.py      # 需要真实 AstrBot 包；找不到时设 ASTRBOT_SITE_PACKAGES
 ```
 
 ## 已知边界
 
-- **只实现到阶段二**：绑定 + 核心注入 + 明确记住 + 关键词/向量混合检索。
-  阶段三的后台自动提取、关系日记、工作状态**没有实现**，配置项 `auto_extract` 保持关闭。
+- **三个阶段都已实现**：绑定 + 核心注入 + 明确记住 + 关键词/向量混合检索（一、二），
+  工作状态 + 关系日记 + 后台自动提取（三）。`auto_extract` 默认关闭：先观察日记与
+  状态是否合意，再决定是否打开后台提取。
+- 自动提取只能写 `observed_dialogue`，不会替你「确认」事实；主人明确说过的话才是
+  `owner_asserted`，也不会被自动提取覆盖。
 - 记忆是「参考材料」，不是指令；身份与权限只由后端核验结果决定。
 - 没有成功回执就不会说「记住了」；删除后不会因备份或旧任务复活。
 - 示例对话、预设故事与真实经历分开标注，不会混成「上次我们……」。
