@@ -239,6 +239,15 @@ def install_fake_astrbot() -> None:
         def on_llm_request(self, *a, **k):
             return lambda fn: fn
 
+        def on_llm_response(self, *a, **k):
+            return lambda fn: fn
+
+        def on_agent_done(self, *a, **k):
+            return lambda fn: fn
+
+        def after_message_sent(self, *a, **k):
+            return lambda fn: fn
+
         def command(self, *a, **k):
             return lambda fn: fn
 
@@ -303,6 +312,14 @@ class FakeEvent:
 
     def get_group_id(self):
         return self._group
+
+    def get_session_id(self):
+        if self._group:
+            return f"aiocqhttp:GroupMessage:{self._group}"
+        return f"aiocqhttp:FriendMessage:{self._user}"
+
+    def is_private_chat(self):
+        return not self._group
 
     def get_sender_name(self):
         return "测试者"
@@ -431,6 +448,27 @@ def test_plugin() -> None:
         await plugin.inject_memory(FakeEvent("记住 我养了一只猫"), FakeRequest("BASE"))
         after = len(store.list_records(limit=100))
         check("暂停后不写入", before == after, f"{before}->{after}")
+
+        # 10. 工作状态指令
+        replies = await collect(plugin.feiyu_command(FakeEvent(""), "当前 在接线阶段三"))
+        check("状态指令回执", replies and "当前状态" in replies[0], str(replies))
+        states = store.active_states("primary", [("owner_private", ""), ("owner_public", "")], 6)
+        check("状态已入库", any("接线阶段三" in s["content"] for s in states), str(states))
+        replies = await collect(plugin.feiyu_command(FakeEvent(""), "当前"))
+        check("状态列表可看", replies and "接线阶段三" in replies[0], str(replies))
+
+        # 11. 日记指令（还没有日记时可看提示，有则能列出）
+        replies = await collect(plugin.feiyu_command(FakeEvent(""), "日记"))
+        check("空日记有提示", replies and ("还没写" in replies[0] or "关系日记" in replies[0]),
+              str(replies))
+        store.add_record(
+            owner_id="primary", kind="diary", content="今天一起接线了阶段三。",
+            epistemic_type="derived", scope_type="owner_private",
+            derived_from_ids=["r_placeholder"], created_by="diary",
+        )
+        replies = await collect(plugin.feiyu_command(FakeEvent(""), "日记"))
+        check("日记可列出", replies and "阶段三" in replies[0], str(replies))
+
         await plugin.terminate()
 
     asyncio.run(scenario())
