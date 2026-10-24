@@ -8,7 +8,7 @@
   "db_path": {
     "type": "string",
     "description": "记忆库路径（留空用默认）",
-    "hint": "默认 D:\\DSH\\让大肥鱼活起来\\memory\\feiyu_memory.db；也可用环境变量 FEIYU_MEMORY_DB 覆盖。改路径前先停机器人。",
+    "hint": "留空时用环境变量 FEIYU_MEMORY_DB，否则 <项目根>/memory/feiyu_memory.db。改路径前先停机器人。",
     "default": ""
   },
   "inject_persona": {
@@ -77,10 +77,93 @@
     "hint": "需要 AstrBot 里已配置嵌入模型；没配置会自动退化为中文关键词检索，不报错。",
     "default": true
   },
+  "state_max_chars": {
+    "type": "int",
+    "description": "「当前状态」注入预算（字符）",
+    "hint": "工作状态只注入最靠前的几条，默认 200。",
+    "default": 200
+  },
+  "state_ttl_days": {
+    "type": "int",
+    "description": "工作状态默认有效期（天）",
+    "hint": "到期自动归档，不再注入。默认 7 天。",
+    "default": 7
+  },
+  "diary_enable": {
+    "type": "bool",
+    "description": "关系日记",
+    "hint": "每天到点（默认 23:30）把当天真实发生的记忆写成一篇短日记，只在私聊注入。",
+    "default": true
+  },
+  "diary_hour": {
+    "type": "int",
+    "description": "日记触发小时（0-23）",
+    "hint": "到点后由后台循环写；当天已写过就不会重复写。",
+    "default": 23
+  },
+  "diary_minute": {
+    "type": "int",
+    "description": "日记触发分钟（0-59）",
+    "default": 30
+  },
+  "diary_min_records": {
+    "type": "int",
+    "description": "写日记所需的最少素材条数",
+    "hint": "素材太少就不写，避免日记变成流水账。默认 3。",
+    "default": 3
+  },
+  "diary_max_chars": {
+    "type": "int",
+    "description": "「关系日记」注入预算（字符）",
+    "hint": "只注入最近一篇，默认 240。",
+    "default": 240
+  },
   "auto_extract": {
     "type": "bool",
-    "description": "后台自动提取（阶段三，未实现）",
-    "hint": "保持关闭。阶段三的提取器与关系日记尚未实现，打开也不会生效。",
+    "description": "后台自动提取（阶段三）",
+    "hint": "开启后，每隔几轮由模型从真实对话里提取稳定信息，代码侧校验证据后才入库。默认关闭，先观察日记与工作状态是否顺手再开。",
     "default": false
+  },
+  "extract_batch_turns": {
+    "type": "int",
+    "description": "每批聚合几轮对话",
+    "hint": "默认 6 轮。太少会增加调用次数，太多会模糊上下文。",
+    "default": 6
+  },
+  "extract_idle_minutes": {
+    "type": "int",
+    "description": "空闲多少分钟后提前提取",
+    "hint": "不足一批但已经空闲这么久，也会先处理。默认 5 分钟。",
+    "default": 5
+  },
+  "extract_min_confidence": {
+    "type": "float",
+    "description": "自动提取的最低置信度",
+    "hint": "默认 0.7。低于阈值的候选直接丢弃，宁可少记。",
+    "default": 0.7
+  },
+  "extract_daily_limit": {
+    "type": "int",
+    "description": "自动提取每天最多写几条",
+    "hint": "默认 40。防止某天聊太多把记忆库灌爆。",
+    "default": 40
+  },
+  "allow_auto_public": {
+    "type": "bool",
+    "description": "允许自动提取写入公开范围",
+    "hint": "默认关闭：自动提取一律只写私聊可见。只有你确实想让她在群里提起才打开。",
+    "default": false
+  },
+  "extract_model": {
+    "type": "string",
+    "description": "提取用的模型（可选）",
+    "hint": "留空用当前对话模型。填了会作为 text_chat 的 model 参数。",
+    "default": ""
+  },
+  "diary_model": {
+    "type": "string",
+    "description": "写日记用的模型（可选）",
+    "hint": "留空用当前对话模型。",
+    "default": ""
   }
 }
