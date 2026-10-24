@@ -1,0 +1,86 @@
+{
+  "enabled": {
+    "type": "bool",
+    "description": "启用长期记忆",
+    "hint": "关掉后不再注入也不写入，但数据库文件保持不动。",
+    "default": true
+  },
+  "db_path": {
+    "type": "string",
+    "description": "记忆库路径（留空用默认）",
+    "hint": "默认 D:\\DSH\\让大肥鱼活起来\\memory\\feiyu_memory.db；也可用环境变量 FEIYU_MEMORY_DB 覆盖。改路径前先停机器人。",
+    "default": ""
+  },
+  "inject_persona": {
+    "type": "bool",
+    "description": "注入内置人格正文",
+    "hint": "把插件自带的鲸鱼娘系统人格放在系统提示最前面。如果你改用 AstrBot 人格配置，就关掉这里，避免两份人格叠加。",
+    "default": true
+  },
+  "persona_file": {
+    "type": "string",
+    "description": "自定义人格文件（可选）",
+    "hint": "留空用插件目录下的 persona_default.txt；填绝对路径或相对插件目录的路径。注入人格关掉时此项无效。",
+    "default": ""
+  },
+  "max_memory_chars": {
+    "type": "int",
+    "description": "记忆参考资料总预算（字符）",
+    "hint": "默认 1000，约 600-1200 token 的中文预算。太小会挤掉经历，太大容易喧宾夺主。",
+    "default": 1000
+  },
+  "core_max_chars": {
+    "type": "int",
+    "description": "主人核心预算（字符）",
+    "hint": "称呼、关系、边界等固定设定的上限，默认 420。",
+    "default": 420
+  },
+  "max_recalled": {
+    "type": "int",
+    "description": "每轮最多注入几条召回记录",
+    "hint": "方案建议 3-5 条。",
+    "default": 4
+  },
+  "min_score": {
+    "type": "float",
+    "description": "召回最低相关度",
+    "hint": "默认 2.5。调高更保守（少答错往事），调低更容易翻出旧事。",
+    "default": 2.5
+  },
+  "search_timeout_ms": {
+    "type": "int",
+    "description": "检索超时（毫秒）",
+    "hint": "超时只丢旧记录，不丢主人身份；核心记忆会继续注入。默认 1200。",
+    "default": 1200
+  },
+  "auto_capture_owner_private": {
+    "type": "bool",
+    "description": "主人私聊自然语言捕获",
+    "hint": "主人以“记住…／记一下…／别忘了…”开头的句子会被直接写入并回执；只有已绑定的主人私聊生效。",
+    "default": true
+  },
+  "owner_private_default_scope": {
+    "type": "string",
+    "description": "主人新记录默认范围",
+    "hint": "填 owner_private（默认，仅私聊可见）或 owner_public（可在主人面前公开）。群聊永远看不到 owner_private。",
+    "default": "owner_private"
+  },
+  "group_memory_enabled": {
+    "type": "bool",
+    "description": "群友长期记忆（阶段二预留）",
+    "hint": "默认关闭。开启后群内关于当前说话者的记录才会参与召回；跨群不共享。",
+    "default": false
+  },
+  "vector_search": {
+    "type": "bool",
+    "description": "使用嵌入向量辅助检索",
+    "hint": "需要 AstrBot 里已配置嵌入模型；没配置会自动退化为中文关键词检索，不报错。",
+    "default": true
+  },
+  "auto_extract": {
+    "type": "bool",
+    "description": "后台自动提取（阶段三，未实现）",
+    "hint": "保持关闭。阶段三的提取器与关系日记尚未实现，打开也不会生效。",
+    "default": false
+  }
+}
