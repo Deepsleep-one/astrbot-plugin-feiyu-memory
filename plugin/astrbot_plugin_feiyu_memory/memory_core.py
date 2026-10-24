@@ -38,6 +38,7 @@ KINDS = (
     "preference",   # 长期偏好
     "event",        # 真实共同经历
     "commitment",   # 约定/待办
+    "state",        # 工作状态（短时，靠 expires_at 过期）
     "lore",         # 预设故事/角色背景
     "diary",        # 关系日记（派生）
     "relationship", # 关系核心事实
@@ -309,6 +310,7 @@ class MemoryStore:
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._init_schema()
+        self._migrate()
 
     # -- 基础 ---------------------------------------------------------------- #
 
@@ -347,6 +349,31 @@ class MemoryStore:
                     (str(SCHEMA_VERSION),),
                 )
                 self._conn.commit()
+
+    def _migrate(self) -> None:
+        """轻量迁移：只加列/索引，不改动已有数据。"""
+        with self._lock:
+            cols = {
+                r["name"]
+                for r in self._conn.execute("PRAGMA table_info(memory_jobs)")
+            }
+            if "attempts" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE memory_jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0"
+                )
+            if "dedupe_key" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE memory_jobs ADD COLUMN dedupe_key TEXT NOT NULL DEFAULT ''"
+                )
+            self._conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_dedupe_pending "
+                "ON memory_jobs(dedupe_key) WHERE status='pending' AND dedupe_key<>''"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_jobs_status "
+                "ON memory_jobs(status, created_at)"
+            )
+            self._conn.commit()
 
     def audit(self, action: str, *, actor: str = "", record_id: str = "",
               detail: str = "") -> None:
@@ -694,6 +721,7 @@ class MemoryStore:
         kinds: list[str] | None = None,
         scope_type: str | None = None,
         scope_id: str | None = None,
+        since: str | None = None,
         limit: int = 200,
     ) -> list[dict]:
         sql = "SELECT * FROM memory_records WHERE 1=1"
@@ -713,6 +741,9 @@ class MemoryStore:
         if scope_id is not None:
             sql += " AND scope_id=?"
             params.append(scope_id)
+        if since:
+            sql += " AND asserted_at >= ?"
+            params.append(since)
         sql += " ORDER BY importance DESC, asserted_at DESC LIMIT ?"
         params.append(int(limit))
         with self._lock:
@@ -768,6 +799,7 @@ class MemoryStore:
             )
         self.audit("record_correct", actor=actor, record_id=rid,
                    detail=f"修正 {record_id}: {compact(new_content, 80)}")
+        self.invalidate_derived(record_id, reason="源记录被纠正", actor=actor)
         return self.get_record(rid) or {}
 
     def forget_record(self, record_id: str, *, reason: str = "",
@@ -797,6 +829,7 @@ class MemoryStore:
             )
         self.audit("record_forget", actor=actor, record_id=record_id,
                    detail=reason or compact(rec["content"], 80))
+        self.invalidate_derived(record_id, reason="源记录被忘记", actor=actor)
         return True
 
     def complete_commitment(self, record_id: str, *, actor: str = "owner") -> bool:
@@ -810,6 +843,241 @@ class MemoryStore:
             )
         self.audit("commitment_done", actor=actor, record_id=record_id)
         return True
+
+    # -- 后台任务队列 -------------------------------------------------------- #
+
+    def enqueue_job(
+        self,
+        kind: str,
+        payload: dict,
+        *,
+        dedupe_key: str = "",
+        deletion_epoch: int | None = None,
+    ) -> str | None:
+        """入队一个后台任务；相同 dedupe_key 的未完成任务不会重复入队。"""
+        with self._lock:
+            if dedupe_key:
+                dup = self._conn.execute(
+                    "SELECT id FROM memory_jobs WHERE dedupe_key=? "
+                    "AND status IN ('pending','running')",
+                    (dedupe_key,),
+                ).fetchone()
+                if dup:
+                    return None
+            jid = new_id("j")
+            with self._tx() as c:
+                c.execute(
+                    "INSERT INTO memory_jobs(id, kind, status, payload, "
+                    "deletion_epoch, dedupe_key, created_at) "
+                    "VALUES(?,?, 'pending', ?,?,?,?)",
+                    (
+                        jid,
+                        kind,
+                        json.dumps(payload, ensure_ascii=False),
+                        int(self.deletion_epoch()
+                            if deletion_epoch is None else deletion_epoch),
+                        dedupe_key,
+                        now_iso(),
+                    ),
+                )
+        return jid
+
+    def claim_jobs(self, limit: int = 5) -> list[dict]:
+        """取出待处理任务并标记 running；deletion_epoch 已经过期的一律丢弃。"""
+        now = now_iso()
+        with self._tx() as c:
+            rows = c.execute(
+                "SELECT * FROM memory_jobs WHERE status='pending' "
+                "ORDER BY created_at LIMIT ?",
+                (max(1, int(limit)),),
+            ).fetchall()
+            claimed: list[dict] = []
+            for row in rows:
+                d = dict(row)
+                if int(d.get("deletion_epoch") or 0) < self.deletion_epoch():
+                    c.execute(
+                        "UPDATE memory_jobs SET status='dropped', "
+                        "finished_at=?, error=? WHERE id=?",
+                        (now, "删除纪元已推进，任务作废", d["id"]),
+                    )
+                    continue
+                c.execute(
+                    "UPDATE memory_jobs SET status='running', started_at=?, "
+                    "attempts=attempts+1 WHERE id=?",
+                    (now, d["id"]),
+                )
+                d["payload"] = json.loads(d.get("payload") or "{}")
+                claimed.append(d)
+        return claimed
+
+    def finish_job(self, job_id: str, result: str = "") -> None:
+        with self._tx() as c:
+            c.execute(
+                "UPDATE memory_jobs SET status='done', result=?, finished_at=? "
+                "WHERE id=?",
+                (str(result)[:2000], now_iso(), job_id),
+            )
+
+    def fail_job(self, job_id: str, error: str, *, max_attempts: int = 3) -> str:
+        """失败处理：没超过次数就退回 pending，否则标 failed。返回最终状态。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT attempts FROM memory_jobs WHERE id=?", (job_id,)
+            ).fetchone()
+            attempts = int(row["attempts"]) if row else 0
+            status = "pending" if attempts < max_attempts else "failed"
+            with self._tx() as c:
+                c.execute(
+                    "UPDATE memory_jobs SET status=?, error=?, "
+                    "started_at=CASE WHEN ?='pending' THEN NULL ELSE started_at END "
+                    "WHERE id=?",
+                    (status, str(error)[:1000], status, job_id),
+                )
+        return status
+
+    def requeue_stale_jobs(self, older_than_minutes: int = 10) -> int:
+        """进程被杀导致 running 悬挂时，把超时任务退回 pending。"""
+        cutoff = (now_dt() - timedelta(minutes=max(1, older_than_minutes))).isoformat()
+        with self._tx() as c:
+            cur = c.execute(
+                "UPDATE memory_jobs SET status='pending', started_at=NULL, "
+                "error='worker 超时退回' "
+                "WHERE status='running' AND started_at IS NOT NULL AND started_at < ?",
+                (cutoff,),
+            )
+            return cur.rowcount or 0
+
+    def job_counts(self) -> dict:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT status, COUNT(*) AS n FROM memory_jobs GROUP BY status"
+            ).fetchall()
+        out = {"pending": 0, "running": 0, "done": 0, "failed": 0, "dropped": 0}
+        for row in rows:
+            out[row["status"]] = int(row["n"])
+        return out
+
+    def pending_job_span(self) -> tuple[int, str | None]:
+        """返回 (pending 数量, 最早一条的 created_at)。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n, MIN(created_at) AS oldest "
+                "FROM memory_jobs WHERE status='pending'"
+            ).fetchone()
+        return int(row["n"] or 0), row["oldest"]
+
+    # -- 工作状态（P5） ------------------------------------------------------ #
+
+    def set_state(
+        self,
+        owner_id: str,
+        content: str,
+        *,
+        scope_type: str = "owner_private",
+        scope_id: str = "",
+        ttl_days: int = 7,
+        fact_key: str = "state.current",
+        epistemic_type: str = "owner_asserted",
+        importance: int = 4,
+        platform: str = "",
+        bot_instance: str = "",
+        created_by: str = "owner",
+        evidence: list[dict] | None = None,
+    ) -> dict:
+        """写一条带有效期的当前状态；同 fact_key 会自动取代旧状态。"""
+        expires_at = (now_dt() + timedelta(days=max(1, int(ttl_days)))).isoformat()
+        return self.add_record(
+            owner_id=owner_id,
+            kind="state",
+            content=content,
+            epistemic_type=epistemic_type,
+            scope_type=scope_type,
+            scope_id=scope_id,
+            fact_key=fact_key,
+            expires_at=expires_at,
+            importance=importance,
+            platform=platform,
+            bot_instance=bot_instance,
+            created_by=created_by,
+            evidence=evidence or [],
+        )
+
+    def active_states(
+        self,
+        owner_id: str,
+        view: list[tuple[str, str]],
+        limit: int = 6,
+    ) -> list[dict]:
+        if not view:
+            return []
+        clauses = []
+        params: list = [owner_id, now_iso()]
+        for st, sid in view:
+            clauses.append("(scope_type=? AND scope_id=?)")
+            params.extend([st, sid])
+        params.append(max(1, int(limit)))
+        sql = (
+            "SELECT * FROM memory_records WHERE owner_id=? AND status='active' "
+            "AND kind='state' AND (expires_at IS NULL OR expires_at > ?) "
+            "AND (" + " OR ".join(clauses) + ") "
+            "ORDER BY importance DESC, asserted_at DESC LIMIT ?"
+        )
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def expire_states(self) -> int:
+        """把过期的 state 归档为 superseded；返回处理条数。"""
+        now = now_iso()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id FROM memory_records WHERE kind='state' "
+                "AND status='active' AND expires_at IS NOT NULL AND expires_at <= ?",
+                (now,),
+            ).fetchall()
+            ids = [r["id"] for r in rows]
+            if not ids:
+                return 0
+            with self._tx() as c:
+                for rid in ids:
+                    c.execute(
+                        "UPDATE memory_records SET status=?, valid_to=?, updated_at=? "
+                        "WHERE id=?",
+                        (STATUS_SUPERSEDED, now, now, rid),
+                    )
+        self.audit("state_expire", actor="system", detail=f"{len(ids)} 条工作状态到期归档")
+        return len(ids)
+
+    # -- 派生失效 ------------------------------------------------------------ #
+
+    def invalidate_derived(self, source_id: str, *, reason: str = "",
+                           actor: str = "owner") -> int:
+        """源记录被删除/取代后，让引用它的派生记录（如关系日记）一并失效。"""
+        if not source_id:
+            return 0
+        now = now_iso()
+        needle = f'%"{source_id}"%'
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id FROM memory_records WHERE status='active' "
+                "AND derived_from_ids LIKE ?",
+                (needle,),
+            ).fetchall()
+            ids = [r["id"] for r in rows]
+            if not ids:
+                return 0
+            with self._tx() as c:
+                for rid in ids:
+                    c.execute(
+                        "UPDATE memory_records SET status=?, valid_to=?, updated_at=? "
+                        "WHERE id=?",
+                        (STATUS_SUPERSEDED, now, now, rid),
+                    )
+        self.audit(
+            "derived_invalidate", actor=actor, record_id=source_id,
+            detail=f"源记录失效，连带 {len(ids)} 条派生记录：{reason}"[:500],
+        )
+        return len(ids)
 
     # -- 向量 ---------------------------------------------------------------- #
 
@@ -937,6 +1205,8 @@ class MemoryStore:
         raw = query.lower()
         scored = []
         for rec in cands:
+            if rec.get("kind") == "state":
+                continue  # 工作状态走独立注入段，不再参与召回排序
             s = self._score(rec, latin, grams, raw, vector)
             if s >= min_score:
                 scored.append((s, rec))
@@ -1028,6 +1298,42 @@ class MemoryStore:
                 lines.append(f"- {title}：{row['content']}")
             if lines:
                 sections.append(("主人核心", lines, core_max_chars))
+
+        # 工作状态（P5）：短时记忆，带 expires_at，只在可见范围里注入
+        if is_owner and owner:
+            try:
+                state_rows = self.active_states(
+                    owner_id,
+                    self._scope_view(is_owner, scene, group_id, user_id),
+                    4,
+                )
+            except Exception:
+                state_rows = []
+            if state_rows:
+                sections.append((
+                    "当前状态",
+                    [f"- {compact(r['content'], 100)}" for r in state_rows[:3]],
+                    int(cfg.get("state_max_chars", 200)),
+                ))
+
+        # 关系日记（P4）：派生内容，只在私聊注入最新一条
+        if is_owner and owner and scene == "private":
+            diaries = self.list_records(
+                owner_id=owner_id,
+                status=STATUS_ACTIVE,
+                kinds=["diary"],
+                scope_type="owner_private",
+                limit=1,
+            )
+            if diaries:
+                sections.append((
+                    "关系日记",
+                    [
+                        f"- {EPISTEMIC_TAG.get('derived', '')}"
+                        f"{compact(diaries[0]['content'], 200)}"
+                    ],
+                    int(cfg.get("diary_max_chars", 240)),
+                ))
 
         # 约定：始终注入未完成的约定
         if is_owner and owner:
@@ -1159,6 +1465,17 @@ class MemoryStore:
                 "evidence": one("SELECT COUNT(*) FROM memory_evidence"),
                 "embeddings": one("SELECT COUNT(*) FROM memory_embeddings"),
                 "tombstones": one("SELECT COUNT(*) FROM memory_tombstones"),
+                "states": one(
+                    "SELECT COUNT(*) FROM memory_records WHERE kind='state' "
+                    "AND status='active'"
+                ),
+                "diaries": one(
+                    "SELECT COUNT(*) FROM memory_records WHERE kind='diary' "
+                    "AND status='active'"
+                ),
+                "jobs_pending": one(
+                    "SELECT COUNT(*) FROM memory_jobs WHERE status='pending'"
+                ),
                 "deletion_epoch": self.deletion_epoch(),
                 "capture": self.capture_enabled(),
                 "schema_version": one(
@@ -1211,6 +1528,7 @@ class MemoryStore:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._init_schema()
+        self._migrate()
         reapplied = 0
         with self._tx() as c:
             for t in tombstones:
