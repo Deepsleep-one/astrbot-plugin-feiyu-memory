@@ -26,8 +26,9 @@ from pathlib import Path
 
 SCHEMA_VERSION = 1
 
-# 项目根目录：默认取本机部署位置，可用环境变量覆盖。
-DEFAULT_PROJECT_ROOT = os.environ.get("FEIYU_PROJECT_ROOT", r"D:\DSH\让大肥鱼活起来")
+# 项目根目录：优先环境变量 FEIYU_PROJECT_ROOT，否则用用户主目录下的 feiyu_memory/。
+# 实际部署请显式设置插件配置 db_path（或 FEIYU_MEMORY_DB），避免依赖默认值。
+DEFAULT_PROJECT_ROOT = os.environ.get("FEIYU_PROJECT_ROOT") or str(Path.home() / "feiyu_memory")
 DEFAULT_DB_NAME = "feiyu_memory.db"
 
 LOCAL_TZ = timezone(timedelta(hours=8))
