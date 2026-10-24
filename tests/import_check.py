@@ -69,4 +69,12 @@ assert list(inject.parameters) == ["self", "event", "req"], list(inject.paramete
 print("on_llm_request 形参 ok：", list(inject.parameters))
 
 assert hasattr(plugin_cls, "initialize") and hasattr(plugin_cls, "terminate")
+
+queue = inspect.signature(plugin_cls.queue_turn, eval_str=True)
+assert list(queue.parameters) == ["self", "event", "response"], list(queue.parameters)
+print("on_llm_response 形参 ok：", list(queue.parameters))
+
+stage3 = inspect.signature(plugin_cls.maybe_write_diary, eval_str=True) \
+    if hasattr(plugin_cls, "maybe_write_diary") else None
+print("阶段三方法：", "有" if stage3 else "未暴露（用 _stage3_instance）")
 print("导入检查通过。")
