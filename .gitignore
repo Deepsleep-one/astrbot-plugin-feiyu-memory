@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+
+# 运行时产物与个人数据，不入库
+memory/
+*.db
+*.db-wal
+*.db-shm
+backups/
+tests/_tmp/
+_device*.json
+
+# 本地环境
+.venv/
+.vscode/
+.idea/
