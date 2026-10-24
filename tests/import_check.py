@@ -26,8 +26,8 @@ CANDIDATES = []
 if os.environ.get("ASTRBOT_SITE_PACKAGES"):
     CANDIDATES.append(Path(os.environ["ASTRBOT_SITE_PACKAGES"]))
 CANDIDATES += [
+    ROOT / "plugins" / "astrbot" / "Lib" / "site-packages",
     ROOT / "astrbot-tools" / "astrbot" / "Lib" / "site-packages",
-    Path(r"D:\DSH\QQBot\astrbot-tools\astrbot\Lib\site-packages"),
 ]
 for candidate in CANDIDATES:
     if candidate.exists():
@@ -39,8 +39,6 @@ try:
 except ModuleNotFoundError:
     print("找不到 AstrBot：把它的 site-packages 目录设进 ASTRBOT_SITE_PACKAGES 再跑。")
     raise SystemExit(2)
-
-import astrbot  # noqa: E402
 
 print("astrbot:", astrbot.__file__)
 
