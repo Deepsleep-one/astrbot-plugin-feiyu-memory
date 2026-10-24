@@ -96,6 +96,9 @@ docs/USAGE.md                         使用说明（指令、隐私矩阵、备
 `auto_capture_owner_private`、`owner_private_default_scope`、`group_memory_enabled`、
 `vector_search`、`auto_extract`。
 
+`db_path` 留空时回退到 `~/feiyu_memory/memory/feiyu_memory.db`（或环境变量
+`FEIYU_MEMORY_DB` / `FEIYU_PROJECT_ROOT`），正式部署建议显式指定一个固定路径。
+
 ## 测试
 
 ```powershell
