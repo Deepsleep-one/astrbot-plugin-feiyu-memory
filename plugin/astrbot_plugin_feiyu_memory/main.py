@@ -1,13 +1,13 @@
 """大肥鱼长期记忆联动 · AstrBot 插件
 
-阶段一 + 阶段二实现：
+阶段一 + 阶段二 + 阶段三：
 - 主人身份由本地管理 CLI 绑定（聊天自称无效），插件只读取绑定结果；
 - 每轮按“场合 + 身份”先做权限过滤，再注入[后端核验的交互状态]与[记忆参考资料]；
 - 私聊主人可显式记忆、查看、纠正、忘记；群聊只注入公开版；
 - 记录带证据与删除墓碑，忘记后不复活；
-- 检索失败/超时只丢失“旧记录”，不会丢失主人身份。
-
-阶段三（后台自动提取、关系日记）默认关闭，见 README。
+- 检索失败/超时只丢失“旧记录”，不会丢失主人身份；
+- 阶段三：工作状态（带有效期）、每天 23:30 的关系日记、按批后台提取
+  （默认只在私聊、只写 observed_dialogue、代码侧校验证据）。
 """
 
 from __future__ import annotations
@@ -29,6 +29,7 @@ from .memory_core import (
     MemoryStore,
     compact,
 )
+from .memory_stage3 import Stage3
 
 PLUGIN_NAME = "astrbot_plugin_feiyu_memory"
 
@@ -46,9 +47,9 @@ KIND_BY_KEYWORD = [
 @register(
     PLUGIN_NAME,
     "大肥鱼项目",
-    "大肥鱼长期记忆联动：主人身份核验、分层记忆注入、显式记忆与纠正/忘记、证据与备份。",
-    "0.1.0",
-    "https://github.com/local/dafeiyu-memory",
+    "大肥鱼长期记忆联动：主人身份核验、分层记忆注入、显式记忆与纠正/忘记、证据与备份，附工作状态、关系日记与后台提取。",
+    "0.2.0",
+    "https://github.com/Deepsleep-one/astrbot-plugin-feiyu-memory",
 )
 class FeiyuMemoryPlugin(Star):
     def __init__(self, context: Context, config=None):
@@ -61,6 +62,8 @@ class FeiyuMemoryPlugin(Star):
         self._embedding_checked = False
         self._loop: asyncio.AbstractEventLoop | None = None
         self._bg_tasks: set[asyncio.Task] = set()
+        self._stage3: Stage3 | None = None
+        self._pending_turns: dict[str, dict] = {}
 
     # ------------------------------------------------------------------ #
     # 生命周期
@@ -82,6 +85,18 @@ class FeiyuMemoryPlugin(Star):
             except Exception as exc:  # 记忆不可用不能拖垮聊天
                 self._store_error = str(exc)
                 logger.error("[feiyu-memory] 记忆库初始化失败：%s", exc)
+        if self._cfg_bool("enabled", True) and (
+            self._cfg_bool("auto_extract", False)
+            or self._cfg_bool("diary_enable", True)
+        ):
+            task = asyncio.create_task(self._stage3_loop())
+            self._bg_tasks.add(task)
+            task.add_done_callback(self._bg_tasks.discard)
+            logger.info(
+                "[feiyu-memory] 阶段三循环已启动（auto_extract=%s, diary=%s）",
+                self._cfg_bool("auto_extract", False),
+                self._cfg_bool("diary_enable", True),
+            )
 
     async def terminate(self) -> None:
         for task in list(self._bg_tasks):
@@ -106,6 +121,15 @@ class FeiyuMemoryPlugin(Star):
         try:
             ident = self._identity(event)
             receipt = ""
+            if ident["is_owner"] and ident["scene"] == "private":
+                key = str(event.get_session_id() or ident["user_id"])
+                self._pending_turns[key] = {
+                    "user": event.get_message_str(),
+                    "ident": ident,
+                }
+                if len(self._pending_turns) > 50:
+                    for old_key in list(self._pending_turns)[:10]:
+                        self._pending_turns.pop(old_key, None)
             if (
                 ident["is_owner"]
                 and ident["scene"] == "private"
@@ -157,6 +181,88 @@ class FeiyuMemoryPlugin(Star):
             "[feiyu-memory] 注入 owner=%s scene=%s recalled=%s",
             ctx["is_owner"], ident["scene"], len(ctx["recalled"]),
         )
+
+    @filter.on_llm_response()
+    async def queue_turn(self, event: AstrMessageEvent, response) -> None:
+        """回复成功后，把这一轮放进后台提取队列（不阻塞、不报错给用户）。"""
+        try:
+            if not self._cfg_bool("auto_extract", False):
+                return
+            ident = self._identity(event)
+            if not ident["is_owner"] or ident["scene"] != "private":
+                return
+            key = str(event.get_session_id() or ident["user_id"])
+            pending = self._pending_turns.pop(key, None)
+            if not pending:
+                return
+            text = (getattr(response, "completion_text", "") or "").strip()
+            if not text:
+                return
+            stage3 = self._stage3_instance()
+            if stage3 is None:
+                return
+            stage3.capture_turn(
+                session_id=key,
+                user_text=pending.get("user", ""),
+                assistant_text=text,
+                ident=ident,
+            )
+        except Exception as exc:
+            logger.debug("[feiyu-memory] 入队失败（忽略）：%s", exc)
+
+    async def _stage3_loop(self) -> None:
+        """30 秒一次：清理过期状态、回收悬挂任务、按批提取、到点写日记。"""
+        try:
+            while True:
+                await asyncio.sleep(30)
+                stage3 = self._stage3_instance()
+                if stage3 is None:
+                    continue
+                try:
+                    await stage3.tick()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning("[feiyu-memory] 阶段三 tick 失败：%s", exc)
+        except asyncio.CancelledError:
+            return
+
+    def _stage3_instance(self) -> Stage3 | None:
+        if self._stage3 is not None:
+            return self._stage3
+        store = self._safe_store()
+        if store is None:
+            return None
+        self._stage3 = Stage3(
+            store,
+            self.config,
+            self._llm_call,
+            logger=logger,
+            after_write=self._schedule_embedding,
+        )
+        return self._stage3
+
+    async def _llm_call(self, system_prompt: str, user_prompt: str,
+                        model: str = "") -> str:
+        provider = None
+        try:
+            provider = await self.context.get_using_provider_async()
+        except Exception:
+            try:
+                provider = self.context.get_using_provider()
+            except Exception:
+                provider = None
+        if provider is None:
+            raise RuntimeError("没有可用的对话模型")
+        kwargs = {
+            "prompt": user_prompt,
+            "session_id": "feiyu-stage3",
+            "system_prompt": system_prompt,
+        }
+        if model:
+            kwargs["model"] = model
+        resp = await provider.text_chat(**kwargs)
+        return (getattr(resp, "completion_text", "") or "").strip()
 
     # ------------------------------------------------------------------ #
     # 聊天指令
@@ -223,6 +329,32 @@ class FeiyuMemoryPlugin(Star):
                 yield event.plain_result(
                     await asyncio.to_thread(self._done_text, store, ident, arg)
                 )
+            elif action in ("当前", "在忙", "state"):
+                yield event.plain_result(
+                    await asyncio.to_thread(self._state_text, store, ident, arg)
+                )
+            elif action in ("日记", "diary"):
+                yield event.plain_result(self._diary_text(store, ident))
+            elif action in ("写日记", "diary+"):
+                stage3 = self._stage3_instance()
+                if stage3 is None:
+                    yield event.plain_result("阶段三没就绪，看看日志。")
+                    return
+                res = await stage3.maybe_write_diary(force=True)
+                if res.get("written"):
+                    yield event.plain_result("写好了，下次私聊会带上。")
+                else:
+                    yield event.plain_result(f"没写成：{res.get('reason', '素材不够')}")
+            elif action in ("提取", "extract"):
+                stage3 = self._stage3_instance()
+                if stage3 is None:
+                    yield event.plain_result("阶段三没就绪，看看日志。")
+                    return
+                res = await stage3.process_pending(force=True)
+                yield event.plain_result(
+                    f"处理 {res.get('processed', 0)} 轮，新记 {res.get('written', 0)} 条，"
+                    f"跳过 {res.get('skipped', 0)} 条。"
+                )
             elif action in ("暂停", "pause"):
                 store.set_control("capture_enabled", "0", actor="owner")
                 yield event.plain_result("记录先停了，已有的照常认。发 /feiyu 恢复 再开。")
@@ -252,6 +384,10 @@ class FeiyuMemoryPlugin(Star):
             "/feiyu 忘记 <编号>\n"
             "/feiyu 撤销 — 撤回上一条刚存的内容\n"
             "/feiyu 约定 <内容> / 完成 <编号>\n"
+            "/feiyu 当前 <在做什么> — 记一条会过期的状态\n"
+            "/feiyu 日记 — 最近的关系日记\n"
+            "/feiyu 写日记 — 现在写一篇\n"
+            "/feiyu 提取 — 立刻处理待提取的对话\n"
             "/feiyu 暂停 / 恢复"
         )
         if not ident["is_owner"]:
@@ -263,10 +399,13 @@ class FeiyuMemoryPlugin(Star):
         return (
             "记忆库：{}\n主人绑定：{} 个\n核心设定：{} 条\n"
             "可用记忆：{} 条（已被取代 {}，已删除 {}）\n"
-            "证据：{} 条，向量：{} 条\n记录开关：{}"
+            "证据：{} 条，向量：{} 条\n"
+            "当前状态：{} 条，关系日记：{} 条，待提取：{} 轮\n"
+            "记录开关：{}"
         ).format(
             s["db_path"], s["owners"], s["core"], s["active"], s["superseded"],
             s["deleted"], s["evidence"], s["embeddings"],
+            s.get("states", 0), s.get("diaries", 0), s.get("jobs_pending", 0),
             "开" if s["capture"] else "暂停",
         )
 
@@ -389,6 +528,52 @@ class FeiyuMemoryPlugin(Star):
             return "给个编号：/feiyu 完成 r_abc123"
         store.complete_commitment(rid, actor="owner")
         return f"结账了：{rid}"
+
+    def _state_text(self, store: MemoryStore, ident: dict, arg: str) -> str:
+        content = (arg or "").strip()
+        if not content:
+            owner_id = (ident["owner"] or {}).get("owner_id", "primary")
+            rows = store.list_records(
+                owner_id=owner_id, kinds=["state"], limit=5
+            )
+            if not rows:
+                return "现在没有记着的状态。用法：/feiyu 当前 在改记忆插件"
+            return "当前状态：\n" + "\n".join(
+                f"· {compact(r['content'], 80)}（{r['id']}，到 "
+                f"{(r['expires_at'] or '')[:10]}）"
+                for r in rows
+            )
+        owner_id = (ident["owner"] or {}).get("owner_id", "primary")
+        rec = store.set_state(
+            owner_id=owner_id,
+            content=content,
+            ttl_days=self._cfg_int("state_ttl_days", 7),
+            platform=ident["platform"],
+            bot_instance=ident["bot_instance"],
+            created_by="owner",
+            evidence=[{
+                "kind": "owner_message",
+                "ref": f"{ident['platform']}:{ident['user_id']}:command",
+                "excerpt": compact(content, 200),
+            }],
+        )
+        self._schedule_embedding(rec["id"], content)
+        return (
+            f"记下了当前状态：{rec['id']}\n{compact(content, 100)}\n"
+            f"到 {(rec['expires_at'] or '')[:10]} 自动过期。"
+        )
+
+    def _diary_text(self, store: MemoryStore, ident: dict) -> str:
+        owner_id = (ident["owner"] or {}).get("owner_id", "primary")
+        rows = store.list_records(
+            owner_id=owner_id, kinds=["diary"], limit=3
+        )
+        if not rows:
+            return "还没写过日记。到点会自动写，也可以用 /feiyu 写日记 手动催一篇。"
+        lines = ["【最近的关系日记】"]
+        for r in rows:
+            lines.append(f"· {r['asserted_at'][:10]}：{compact(r['content'], 160)}")
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------ #
     # 写入
@@ -624,6 +809,8 @@ class FeiyuMemoryPlugin(Star):
             "core_max_chars": self._cfg_int("core_max_chars", 420),
             "max_recalled": self._cfg_int("max_recalled", 4),
             "min_score": self._cfg_float("min_score", 2.5),
+            "state_max_chars": self._cfg_int("state_max_chars", 200),
+            "diary_max_chars": self._cfg_int("diary_max_chars", 240),
         }
 
     def _cfg_str(self, key: str, default: str = "") -> str:
