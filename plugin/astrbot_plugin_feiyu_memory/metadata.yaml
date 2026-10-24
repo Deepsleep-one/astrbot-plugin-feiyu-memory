@@ -1,0 +1,22 @@
+name: astrbot_plugin_feiyu_memory
+display_name: 大肥鱼长期记忆
+short_desc: 主人身份核验 + 分层记忆注入 + 显式记忆/纠正/忘记 + 证据与备份，绑定只能在本地管理入口完成。
+desc: >
+  按《大肥鱼长期记忆联动方案》实现的外挂记忆层。身份锚点为平台+机器人实例+账号，
+  聊天里自称"我是主人"无效。每轮先按场合与身份做权限过滤，再注入后端核验状态与
+  记忆参考资料：主人私聊可见核心与私人档案，主人进群只带公开版，群友各自隔离。
+  记录区分主人确认、带来源的实际对话、预设故事三类来历；忘记写入墓碑，恢复备份
+  不会复活。阶段一/二已实现；后台自动提取（阶段三）默认关闭。
+help: |
+  /feiyu 状态 — 记忆库状态
+  /feiyu 档案 — 核心设定与最近记录
+  /feiyu 记住 <内容>；/feiyu 查看 <编号>
+  /feiyu 纠正 <编号> <新内容>；/feiyu 忘记 <编号>；/feiyu 撤销
+  /feiyu 约定 <内容>；/feiyu 完成 <编号>；/feiyu 暂停 / 恢复
+  以上仅私聊、仅已绑定主人可用。绑定与导入请用 tools/feiyu_memory_admin.py。
+version: v0.1.0
+author: 大肥鱼项目
+repo: https://github.com/Deepsleep-one/astrbot-plugin-feiyu-memory
+astrbot_version: ">=4.16,<5"
+support_platforms:
+  - aiocqhttp
