@@ -1,5 +1,57 @@
 # 变更记录
 
+## v0.6.2（2026-10-25）
+
+修一个**只在老库上才会炸**的迁移 bug —— v0.6.1 上线时线上库直接初始化失败，就是它。
+
+- **现象**：容器重启后日志出现
+  `[feiyu-memory] 记忆库初始化失败：no such column: version`，插件的记忆库整个没起来（后台循环还在跑，但库是空的）。
+- **根因**：v0.6.0 把 `CREATE INDEX IF NOT EXISTS idx_embeddings_meta ON memory_embeddings(model, version, dim)` 写进了 `_SCHEMA`。`_SCHEMA` 在 `_migrate()` **之前**执行，而 `CREATE TABLE IF NOT EXISTS` 不会给已存在的老表补列 —— 老库的 `memory_embeddings` 还没有 `version` 列，于是建索引这一步报 `no such column: version`，整个 `MemoryStore.__init__` 抛异常。
+  新建的空库有 `version` 列，所以所有自测都是绿的，**测试没盖到真实世界**。
+- **修法**：把这条索引从 `_SCHEMA` 移出，只在 `_ensure_embedding_meta()` 里 `ALTER TABLE ... ADD COLUMN version` 之后再建（原来那里就有一份，重复的那份删掉），并加注释说明为什么不能写回 `_SCHEMA`。
+- **新增回归 `tests/selftest_migrate.py`（18 项）**：先造一个「v0.5.0 形态」的老库（去掉 `memory_embeddings.version`、`memory_records.op_hash`、三张新表与新索引），再用新代码打开它，断言：能初始化、补齐列/表/索引、老记录可读且能检索、`vector_health` 仍统计得到、迁移可重入；并静态断言 `_SCHEMA` 里不再有那条索引。
+- 六套自测：58 / 49 / stage4 20 组 / 42 / 61 / 18 全绿。
+
+## v0.6.1（2026-10-25）
+
+只修两个「明明配好了却不认」的操作坑，不动检索算法。
+
+- **嵌入服务商负结果不再缓存到进程结束**：`_ensure_embedding()` 改成只有真探到服务商才置 `_embedding_checked = True`；探不到就记 `_embedding_next_try = time.monotonic() + 60` 并在 60 秒后自动重试。
+  **改前**：面板里刚配好嵌入服务商，插件到重启前一直当「没有嵌入可用」，语义通道静默消失。
+- **新增 `/feiyu 向量 重建`**：`_backfill_vectors(limit=200, rebuild=True)` 会把型号 / 版本 / 维度对不上的旧向量一并重算（用 `vector_health` + `list_stale_embeddings` 取待办，`todo = stale + missing` 去重），回复里报「补了 N 条，重算 M 条」。
+- `/feiyu 状态` 的 stale 提示改为指向 `/feiyu 向量 重建`（原来只提示「待重建」但没告诉人怎么重建）。
+- 帮助文本加一行：`/feiyu 向量 重建 — 换了嵌入模型后，把旧向量全部重算`。
+
+检索通道、操作协议、反思两段式与 v0.6.0 完全一致；五套自测 58 / 49 / stage4 20 组 / 42 / 61 全绿。
+
+## v0.6.0（2026-10-25）
+
+上一版解决了「记错人」，这一版解决「想不起来」和「改错行」。同样是每一条先写成回归测试、看着红再改。
+
+- **真混合检索**（原 M2 第 1 项）。以前 `search()` 先用 FTS 取词法候选，再在候选里算 cosine——语义通道被词法卡死：库里有「主人钟爱猫咪」，用 `feline` 查是 **0 候选**。现在两条通道各自召回：词法走 FTS 索引，语义 `_semantic_candidates()` 自己扫全表向量（过 `_fetch_authorized` 鉴权，不越权），两路合池后用 RRF 融合 `Σ 1/(60 + rank)` 排序。`_score` 与 `min_score` 仍是准入门槛（没有放松），RRF 只决定顺序；只有一路命中时退化为该路排序，没有查询向量时行为与旧版一致。
+- **向量型号校验**（第 2 项）。`memory_embeddings` 加 `version` 列与 `idx_embeddings_meta(model, version, dim)`；`put_embedding()` 同时写 `memory_records.embedding_model / embedding_version`。型号、版本、维度任一不符就不参与打分并计入 `vector_mismatch`——以前换了嵌入模型，旧向量还会被当成可比值照算 cosine。新入口 `vector_health()` / `list_stale_embeddings()`，`/feiyu 状态` 会显示「N 条型号或版本不符待重建」，`/feiyu 向量` 补建。
+- **操作协议**（第 3 项）。`add_record` 增加 `op_hash = _payload_hash(...)`：同 `op_key` 同内容 → 幂等返回旧记录；同 `op_key` 不同内容 → 报「操作冲突」，不再悄悄认回旧记录（以前这条路是静默的错误来源）。`correct_record(..., expected_revision=N)` 支持 CAS：修订号不符直接报「记录已被改写（期望 rN，实际 rM）」，两个进程同时改同一条不会再互相覆盖。
+- **反思两段式**（第 4 项）。`run()` 拆成 `propose()` → `apply()`：提案阶段只算不写（新增 `memory_proposals` / `memory_proposal_items` 两表，带 manifest），应用阶段逐项执行并落回执 `status / reason / result_id`。应用时**再核一次**来源是否仍有效（`validate_sources` 带 revision）、内容是否撞墓碑；期间被忘记的来源会把整项丢掉并写进回执（「来源失效：…」/「来源内容已被主人遗忘」）。重复 `apply` 返回 0，可以放心重试。
+- **检索 trace**（第 5 项）。`search()` 的 stats 现在报告 `mode / lexical_candidates / semantic_candidates / matched / injected / rrf / truncated / truncated_reason`，`build_context` 原样透传——「她为什么没想起来」现在能回答，而不是靠猜。
+- `/feiyu 整理` 会先把上一轮还挂着的提案应用掉，再出这一轮的新提案；`/feiyu 状态` 多一行「待受理的整理提案」。
+- `_conf_schema.json` 新增 `semantic_min`（语义通道余弦门槛，默认 0.30）。
+- 新增回归套件 `tests/selftest_recall.py`（61 项 / 7 组）：语义独立召回、词法命中不被挤掉、RRF 公式与排序、向量型号校验与重建、操作协议、两段式与逐项回执、trace 透传。
+
+已知未修（M3 起）：陪伴运行时与权限/预算还没有；跨插件提案端口只有 memory 侧的存储形态，尚无 companion 侧调用方。
+
+## v0.5.0（2026-10-25）
+
+「记得对」比「记得多」重要。这一版不增加任何新功能，只修四类会让她记错人的缺陷——每一项都先写成回归测试，看着它红，再改代码让它绿。
+
+- **证据必须属于主人**（P0）。以前自动提取会把「主人：…\n助手：…」拼成一段 transcript，只确认证据在整段里存在，不区分谁说的——主人只说「随便聊聊」、助手顺着说「主人养了企鹅」，后一句就能被当成主人的事实写进库。现在 `capture_turn` 存结构化的 `turns=[{role, text}]`，证据必须落在**主人那条消息**里逐字命中；只落在助手行 → 拒收（「证据属于助手自述」）。另加一条独立检查：候选内容若只出现在助手嘴里而主人没说过（`_content_borrowed`），同样拒。`memory_evidence` 新增 `speaker / content_hash / span_start / span_end` 四列，证据从此可追溯到具体那条消息的具体位置。老库按 `PRAGMA table_info` 自动补列。
+- **取消模糊证据**（P0）。`_evidence_supported` 原来在子串失败后允许「二元组覆盖率 ≥0.8」，于是「我不喜欢周末去海边骑自行车」可以拿「我喜欢周末去海边骑自行车」当证据——差一个「不」字，意思完全相反。现在只保留「归一空白后逐字子串」这一条路，新增 `_locate_span` 把命中位置还原成原文坐标。`tokenize` 从本模块的 import 里去掉了。
+- **相似不等于重复**（P0）。提取侧：逐字一致才算「重复」；相似度 ≥0.6 但极性相反 → 写 `extract_conflict` 审计并判「待确认冲突」（原来的 0.85 门槛拦不住 0.786 的「喜欢/不喜欢」）。整理侧：`owner_asserted` 只按逐字归一一致合并，其余要求「重叠度达阈值**且**极性相同」，重叠 0.92 但一肯一否的两条都留着，写 `reflect_conflict` 审计。
+- **多层失效 + 旧证据抑制 + 落库前复核**（P0）。新增 `memory_edges(child_id, parent_id)` 依赖边表（`add_record` 写 `derived_from_ids` 时同步落边，启动时从旧库的 `derived_from_ids` 幂等回填）。`invalidate_derived` 改成带 `visited` 的广度优先遍历（`max_depth=8`）：A→B→C 现在会一路断到 C，环不会卡住，共享子图只处理一次；旧库没有边时用 `LIKE` 兜底。新增 `MemoryStore.tombstoned()`：主人要求忘掉的内容，同一段旧对话再被提取一次也写不回来（`tombstone_block` 审计）。新增 `MemoryStore.validate_sources()`：反思归纳落库前复核来源仍在、仍 active、revision 没被改写，期间被改过就整簇丢弃。
+- **新增回归套件** `tests/selftest_trust.py`（42 项 / 11 组）与测试入口 `tools/run_selftests.py`（逐套件独立子进程，自动把 `tempfile.mkdtemp` 指到工作区内——沙箱里 0o700 临时目录不可用）。
+- 翻转一条旧期望：`selftest_stage3.py` 里「近义改写能定位」改成「改写不再冒充原文」。它断言的正是本版修掉的 bug。
+
+已知未修（M2）：语义向量仍只是词法候选的**内部重排**，不是独立召回；`op_key` 幂等不校验 payload；`correct_record` 没有 CAS。
+
 ## v0.4.0（2026-10-25）
 
 语义通道真正接上，并且开始「回看」已有的记忆——不只是往里写。三件事都按「宁可不动，也不要写错」的原则做。

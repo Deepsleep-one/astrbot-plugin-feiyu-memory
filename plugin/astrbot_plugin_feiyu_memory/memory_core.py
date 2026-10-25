@@ -260,7 +260,8 @@ CREATE TABLE IF NOT EXISTS memory_records (
     embedding_version TEXT NOT NULL DEFAULT '',
     created_at       TEXT NOT NULL,
     updated_at       TEXT NOT NULL,
-    created_by       TEXT NOT NULL DEFAULT 'owner'
+    created_by       TEXT NOT NULL DEFAULT 'owner',
+    op_hash          TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_records_scope
@@ -269,22 +270,30 @@ CREATE INDEX IF NOT EXISTS idx_records_fact
     ON memory_records(owner_id, fact_key, status);
 
 CREATE TABLE IF NOT EXISTS memory_evidence (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    record_id  TEXT NOT NULL,
-    kind       TEXT NOT NULL DEFAULT 'note',
-    ref        TEXT NOT NULL DEFAULT '',
-    excerpt    TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    record_id    TEXT NOT NULL,
+    kind         TEXT NOT NULL DEFAULT 'note',
+    ref          TEXT NOT NULL DEFAULT '',
+    excerpt      TEXT NOT NULL DEFAULT '',
+    created_at   TEXT NOT NULL,
+    speaker      TEXT NOT NULL DEFAULT '',
+    content_hash TEXT NOT NULL DEFAULT '',
+    span_start   INTEGER,
+    span_end     INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_evidence_record ON memory_evidence(record_id);
 
 CREATE TABLE IF NOT EXISTS memory_embeddings (
     record_id  TEXT PRIMARY KEY,
     model      TEXT NOT NULL,
+    version    TEXT NOT NULL DEFAULT '',
     dim        INTEGER NOT NULL,
     vector     BLOB NOT NULL,
     updated_at TEXT NOT NULL
 );
+-- 注意：idx_embeddings_meta 不在这里建。老库的 memory_embeddings 还没有 version 列，
+-- 而 CREATE TABLE IF NOT EXISTS 不会补列，这里建索引会直接报 "no such column: version"，
+-- 让整个 MemoryStore 初始化失败。索引统一放到 _ensure_embedding_meta() 里 ALTER 之后再建。
 
 CREATE TABLE IF NOT EXISTS memory_jobs (
     id             TEXT PRIMARY KEY,
@@ -320,6 +329,43 @@ CREATE TABLE IF NOT EXISTS memory_tombstones (
     deletion_epoch INTEGER NOT NULL,
     forgotten_at   TEXT NOT NULL,
     reason         TEXT NOT NULL DEFAULT ''
+);
+
+-- 派生依赖边：child 由 parent 推导得来。多层失效靠这张表做图遍历
+-- （只查 derived_from_ids 的 LIKE 只能断一层，A→B→C 会漏掉 C）。
+CREATE TABLE IF NOT EXISTS memory_edges (
+    child_id   TEXT NOT NULL,
+    parent_id  TEXT NOT NULL,
+    relation   TEXT NOT NULL DEFAULT 'derived',
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (child_id, parent_id)
+);
+CREATE INDEX IF NOT EXISTS idx_edges_parent ON memory_edges(parent_id);
+
+-- 记忆操作提案：整理/反思这类批量写入先落成一张提案，复核通过再应用。
+-- 提案与应用分开，是为了让「模型想写什么」和「真的写了什么」各留一份证据。
+CREATE TABLE IF NOT EXISTS memory_proposals (
+    id         TEXT PRIMARY KEY,
+    owner_id   TEXT NOT NULL,
+    kind       TEXT NOT NULL DEFAULT 'reflect_fold',
+    status     TEXT NOT NULL DEFAULT 'pending',
+    manifest   TEXT NOT NULL DEFAULT '{}',
+    result     TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    applied_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS memory_proposal_items (
+    proposal_id TEXT NOT NULL,
+    seq         INTEGER NOT NULL,
+    op          TEXT NOT NULL DEFAULT 'fold',
+    record_id   TEXT NOT NULL DEFAULT '',
+    payload     TEXT NOT NULL DEFAULT '{}',
+    status      TEXT NOT NULL DEFAULT 'pending',
+    reason      TEXT NOT NULL DEFAULT '',
+    result_id   TEXT NOT NULL DEFAULT '',
+    updated_at  TEXT NOT NULL,
+    PRIMARY KEY (proposal_id, seq)
 );
 """
 
@@ -502,9 +548,106 @@ class MemoryStore:
             self._conn.commit()
         self._repair_single_value()
         self._ensure_single_value_index()
+        self._ensure_evidence_spans()
         self._repair_evidence_duplicates()
         self._ensure_idempotency_index()
         self._ensure_search_index()
+        self._backfill_dependency_edges()
+        self._ensure_embedding_meta()
+        self._ensure_op_hash()
+
+    def _ensure_embedding_meta(self) -> bool:
+        """向量要能被按型号校验：老库的 memory_embeddings 缺 version 列。"""
+        cols = {
+            r["name"]
+            for r in self._conn.execute("PRAGMA table_info(memory_embeddings)")
+        }
+        changed = False
+        with self._lock:
+            if "version" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE memory_embeddings "
+                    "ADD COLUMN version TEXT NOT NULL DEFAULT ''"
+                )
+                changed = True
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_embeddings_meta "
+                "ON memory_embeddings(model, version, dim)"
+            )
+            if changed:
+                self._conn.commit()
+        return changed
+
+    def _ensure_op_hash(self) -> bool:
+        """幂等键要能区分「同一次操作」和「同一个键换了内容」。"""
+        cols = {
+            r["name"]
+            for r in self._conn.execute("PRAGMA table_info(memory_records)")
+        }
+        if "op_hash" in cols:
+            return False
+        with self._lock:
+            self._conn.execute(
+                "ALTER TABLE memory_records ADD COLUMN op_hash TEXT NOT NULL DEFAULT ''"
+            )
+            self._conn.commit()
+        return True
+
+    def _ensure_evidence_spans(self) -> bool:
+        """证据要能回溯到「谁、在哪句话、正文哈希」，老库在这里补列。"""
+        cols = {
+            r["name"]
+            for r in self._conn.execute("PRAGMA table_info(memory_evidence)")
+        }
+        specs = (
+            ("speaker", "TEXT NOT NULL DEFAULT ''"),
+            ("content_hash", "TEXT NOT NULL DEFAULT ''"),
+            ("span_start", "INTEGER"),
+            ("span_end", "INTEGER"),
+        )
+        changed = False
+        with self._lock:
+            for name, ddl in specs:
+                if name in cols:
+                    continue
+                self._conn.execute(
+                    f"ALTER TABLE memory_evidence ADD COLUMN {name} {ddl}"
+                )
+                changed = True
+            if changed:
+                self._conn.commit()
+        return changed
+
+    def _backfill_dependency_edges(self) -> int:
+        """把历史记录里的 derived_from_ids 补成依赖边（幂等，每次启动都跑）。"""
+        rows = self._conn.execute(
+            "SELECT id, derived_from_ids FROM memory_records "
+            "WHERE derived_from_ids IS NOT NULL AND derived_from_ids NOT IN ('', '[]')"
+        ).fetchall()
+        added = 0
+        now = now_iso()
+        with self._lock:
+            with self._tx() as c:
+                for row in rows:
+                    try:
+                        parents = json.loads(row["derived_from_ids"] or "[]")
+                    except (TypeError, ValueError):
+                        continue
+                    if not isinstance(parents, list):
+                        continue
+                    for parent in parents:
+                        parent = str(parent or "").strip()
+                        if not parent or parent == row["id"]:
+                            continue
+                        cur = c.execute(
+                            "INSERT OR IGNORE INTO memory_edges("
+                            "child_id, parent_id, relation, created_at) "
+                            "VALUES(?,?,?,?)",
+                            (row["id"], parent, "derived", now),
+                        )
+                        if cur.rowcount > 0:
+                            added += 1
+        return added
 
     def _repair_single_value(self) -> int:
         """同一 (主人, fact_key, 范围) 有多条 active 时，只留最新一条。"""
@@ -872,6 +1015,16 @@ class MemoryStore:
         supersedes_id = None
         revision = 1
         op_key = (op_key or "").strip()[:200]
+        # 负载指纹：同一次操作重跑（键和内容都一样）才幂等；
+        # 同一个键换了内容说明调用方搞混了两件事，必须报冲突而不是悄悄认回旧记录。
+        op_hash = _payload_hash({
+            "kind": kind, "content": content,
+            "epistemic_type": epistemic_type, "scope_type": scope_type,
+            "scope_id": scope_id, "fact_key": fact_key,
+            "source_ids": list(source_ids or []),
+            "derived_from_ids": list(derived_from_ids or []),
+            "importance": int(importance), "confidence": round(float(confidence), 4),
+        }) if op_key else ""
 
         if op_key:
             # 幂等：同一次提取/归纳被重跑时，直接认回已经写过的那条，
@@ -879,9 +1032,16 @@ class MemoryStore:
             # 「今天吃了酸菜鱼」也判成同一条。
             with self._lock:
                 dup = self._conn.execute(
-                    "SELECT id FROM memory_records WHERE op_key=? LIMIT 1", (op_key,)
+                    "SELECT id, op_hash FROM memory_records WHERE op_key=? LIMIT 1",
+                    (op_key,),
                 ).fetchone()
             if dup is not None:
+                stored_hash = str(dup["op_hash"] or "")
+                if stored_hash and op_hash and stored_hash != op_hash:
+                    raise MemoryError(
+                        f"操作键 {op_key} 已用于另一条内容（操作冲突），"
+                        "请换一个 op_key 或先核对调用方"
+                    )
                 existing = self.get_record(dup["id"])
                 if existing is not None:
                     existing["_idempotent"] = True
@@ -921,8 +1081,8 @@ class MemoryStore:
                     derived_from_ids, occurred_at, asserted_at, valid_from, valid_to,
                     confidence, importance, status, expires_at, revision,
                     supersedes_id, deletion_epoch, persona_version, created_at,
-                    updated_at, created_by, op_key
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    updated_at, created_by, op_key, op_hash
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     rid, owner_id, subject_id or owner_id, platform, bot_instance,
@@ -932,16 +1092,28 @@ class MemoryStore:
                     occurred_at, asserted_at or now, valid_from, valid_to,
                     float(confidence), int(importance), STATUS_ACTIVE, expires_at,
                     revision, supersedes_id, self.deletion_epoch(), persona_version,
-                    now, now, created_by, op_key,
+                    now, now, created_by, op_key, op_hash,
                 ),
             )
             for ev in evidence:
                 c.execute(
-                    "INSERT INTO memory_evidence(record_id, kind, ref, excerpt, created_at) "
-                    "VALUES(?,?,?,?,?)",
+                    "INSERT INTO memory_evidence("
+                    "record_id, kind, ref, excerpt, created_at, speaker, "
+                    "content_hash, span_start, span_end) "
+                    "VALUES(?,?,?,?,?,?,?,?,?)",
                     (rid, str(ev.get("kind", "note")), str(ev.get("ref", "")),
-                     str(ev.get("excerpt", ""))[:1000], now),
+                     str(ev.get("excerpt", ""))[:1000], now,
+                     str(ev.get("speaker", "")), str(ev.get("content_hash", "")),
+                     ev.get("span_start"), ev.get("span_end")),
                 )
+            for parent in derived_from_ids or []:
+                parent = str(parent or "").strip()
+                if parent and parent != rid:
+                    c.execute(
+                        "INSERT OR IGNORE INTO memory_edges("
+                        "child_id, parent_id, relation, created_at) VALUES(?,?,?,?)",
+                        (rid, parent, "derived", now),
+                    )
             self._index_tx(c, rid, kind, content)
             row = c.execute(
                 "SELECT * FROM memory_records WHERE id=?", (rid,)
@@ -1128,13 +1300,19 @@ class MemoryStore:
         return [dict(r) for r in rows]
 
     def correct_record(
-        self, record_id: str, new_content: str, *, actor: str = "owner"
+        self, record_id: str, new_content: str, *, actor: str = "owner",
+        expected_revision: int | None = None,
     ) -> dict:
         old = self.get_record(record_id)
         if not old:
             raise MemoryError("记录不存在")
         if old["status"] != STATUS_ACTIVE:
             raise MemoryError(f"记录状态为 {old['status']}，不能直接纠正")
+        if expected_revision is not None and int(old["revision"] or 0) != int(expected_revision):
+            raise MemoryError(
+                f"记录已被改写（期望 r{expected_revision}，实际 r{old['revision']}），"
+                "请重新读取后再改"
+            )
         new_content = (new_content or "").strip()
         if not new_content:
             raise MemoryError("新内容不能为空")
@@ -1425,49 +1603,235 @@ class MemoryStore:
         self.audit("state_expire", actor="system", detail=f"{len(ids)} 条工作状态到期归档")
         return len(ids)
 
-    # -- 派生失效 ------------------------------------------------------------ #
+    # -- 派生失效与来源复核 -------------------------------------------------- #
+
+    def link_dependency(self, child_id: str, parent_id: str,
+                        relation: str = "derived") -> bool:
+        """记一条「child 由 parent 派生」的依赖边；重复调用是幂等的。"""
+        child_id = str(child_id or "").strip()
+        parent_id = str(parent_id or "").strip()
+        if not child_id or not parent_id or child_id == parent_id:
+            return False
+        with self._tx() as c:
+            cur = c.execute(
+                "INSERT OR IGNORE INTO memory_edges("
+                "child_id, parent_id, relation, created_at) VALUES(?,?,?,?)",
+                (child_id, parent_id, relation or "derived", now_iso()),
+            )
+            return cur.rowcount > 0
+
+    def _dependency_children(self, parent_id: str) -> list[str]:
+        rows = self._conn.execute(
+            "SELECT child_id FROM memory_edges WHERE parent_id=?", (parent_id,)
+        ).fetchall()
+        return [str(r["child_id"]) for r in rows]
+
+    def _legacy_derived(self, parent_id: str) -> list[str]:
+        """兼容旧库：依赖边还没回填时，仍按 derived_from_ids 找下游。"""
+        rows = self._conn.execute(
+            "SELECT id FROM memory_records WHERE derived_from_ids LIKE ?",
+            (f'%"{parent_id}"%',),
+        ).fetchall()
+        return [str(r["id"]) for r in rows]
 
     def invalidate_derived(self, source_id: str, *, reason: str = "",
-                           actor: str = "owner") -> int:
-        """源记录被删除/取代后，让引用它的派生记录（如关系日记）一并失效。"""
+                           actor: str = "owner", max_depth: int = 8) -> int:
+        """源记录被删除/取代后，连带**所有层级**的派生记录一起失效。
+
+        依赖边存在 memory_edges 里（add_record 与启动回填都会写），这里做带
+        visited 集合的广度优先遍历：A→B→C 会一路断到 C，环不会卡住，共享子图
+        每个节点只处理一次。max_depth 只是兜底，正常关系链远达不到。
+        """
         if not source_id:
             return 0
         now = now_iso()
-        needle = f'%"{source_id}"%'
+        limit = max(1, int(max_depth))
+        visited = {source_id}
+        frontier = [source_id]
+        depth = 0
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT id FROM memory_records WHERE status='active' "
-                "AND derived_from_ids LIKE ?",
-                (needle,),
-            ).fetchall()
-            ids = [r["id"] for r in rows]
-            if not ids:
-                return 0
-            with self._tx() as c:
-                for rid in ids:
-                    c.execute(
-                        "UPDATE memory_records SET status=?, valid_to=?, updated_at=? "
-                        "WHERE id=?",
-                        (STATUS_SUPERSEDED, now, now, rid),
-                    )
-                    self._unindex_tx(c, rid)
+            while frontier and depth < limit:
+                depth += 1
+                nxt: list[str] = []
+                for node in frontier:
+                    for child in self._dependency_children(node) + self._legacy_derived(node):
+                        if child in visited:
+                            continue
+                        visited.add(child)
+                        nxt.append(child)
+                frontier = nxt
+            targets = [rid for rid in visited if rid != source_id]
+            ids: list[str] = []
+            if targets:
+                with self._tx() as c:
+                    for rid in targets:
+                        cur = c.execute(
+                            "UPDATE memory_records SET status=?, valid_to=?, updated_at=? "
+                            "WHERE id=? AND status=?",
+                            (STATUS_SUPERSEDED, now, now, rid, STATUS_ACTIVE),
+                        )
+                        if cur.rowcount > 0:
+                            ids.append(rid)
+                            self._unindex_tx(c, rid)
+        if not ids:
+            return 0
         self.audit(
             "derived_invalidate", actor=actor, record_id=source_id,
-            detail=f"源记录失效，连带 {len(ids)} 条派生记录：{reason}"[:500],
+            detail=(f"源记录失效，连带 {len(ids)} 条派生记录（{depth} 层）：{reason}")[:500],
         )
         return len(ids)
 
+    def tombstoned(self, content: str) -> bool:
+        """这段正文是否落在墓碑里 —— 即主人要求忘掉过的东西。"""
+        text = (content or "").strip()
+        if not text:
+            return False
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM memory_tombstones WHERE content_hash=? LIMIT 1",
+                (_content_hash(text),),
+            ).fetchone()
+        return row is not None
+
+    def validate_sources(self, record_ids, *,
+                         expected: dict | None = None) -> tuple[bool, str]:
+        """落库前复核来源：必须存在、仍 active、revison 没被改写、没被忘掉。
+
+        ``expected`` 是 {record_id: revision}，用来说明「我当时拿到的是第几版」。
+        """
+        expected = expected or {}
+        ids = [str(r or "").strip() for r in (record_ids or [])]
+        with self._lock:
+            for rid in ids:
+                if not rid:
+                    continue
+                row = self._conn.execute(
+                    "SELECT id, status, revision FROM memory_records WHERE id=?",
+                    (rid,),
+                ).fetchone()
+                if row is None:
+                    return False, f"来源 {rid} 不存在"
+                if row["status"] != STATUS_ACTIVE:
+                    return False, f"来源 {rid} 已不是有效记录（{row['status']}）"
+                want = expected.get(rid)
+                if want is not None and int(row["revision"] or 0) != int(want):
+                    return False, f"来源 {rid} 已被改写（r{want}→r{row['revision']}）"
+        return True, ""
+
+    # -- 记忆操作提案 -------------------------------------------------------- #
+
+    def save_proposal(self, owner_id: str, items: list[dict], *,
+                      kind: str = "reflect_fold",
+                      manifest: dict | None = None) -> dict:
+        """把一批「打算写什么」先落成提案，复核通过再应用。
+
+        提案与应用分开的意义：模型想写的东西和真的写进去的东西各留一份证据，
+        上面审计里能对上号；应用阶段还能再核一次来源有没有失效。
+        """
+        pid = new_id("p")
+        now = now_iso()
+        with self._tx() as c:
+            c.execute(
+                "INSERT INTO memory_proposals("
+                "id, owner_id, kind, status, manifest, result, created_at, applied_at) "
+                "VALUES(?,?,?,?,?,?,?,NULL)",
+                (pid, owner_id, kind, "pending",
+                 json.dumps(manifest or {}, ensure_ascii=False), "{}", now),
+            )
+            for seq, item in enumerate(items, 1):
+                c.execute(
+                    "INSERT INTO memory_proposal_items("
+                    "proposal_id, seq, op, record_id, payload, status, reason, "
+                    "result_id, updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (pid, seq, str(item.get("op") or "fold"),
+                     str(item.get("record_id") or ""),
+                     json.dumps(item, ensure_ascii=False),
+                     "pending", "", "", now),
+                )
+        self.audit("proposal_create", actor="reflect",
+                   detail=f"{kind} {pid} items={len(items)}"[:500])
+        return self.get_proposal(pid) or {}
+
+    def get_proposal(self, proposal_id: str) -> dict | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM memory_proposals WHERE id=?", (proposal_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            items = self._conn.execute(
+                "SELECT * FROM memory_proposal_items WHERE proposal_id=? ORDER BY seq",
+                (proposal_id,),
+            ).fetchall()
+        out = dict(row)
+        out["manifest"] = json.loads(out.get("manifest") or "{}")
+        out["result"] = json.loads(out.get("result") or "{}")
+        out["items"] = []
+        for item in items:
+            entry = dict(item)
+            entry["payload"] = json.loads(entry.get("payload") or "{}")
+            out["items"].append(entry)
+        return out
+
+    def list_proposals(self, *, owner_id: str = "", status: str = "",
+                       limit: int = 20) -> list[dict]:
+        sql = "SELECT id FROM memory_proposals WHERE 1=1"
+        params: list = []
+        if owner_id:
+            sql += " AND owner_id=?"
+            params.append(owner_id)
+        if status:
+            sql += " AND status=?"
+            params.append(status)
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        params.append(max(1, int(limit)))
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [self.get_proposal(r["id"]) or {} for r in rows]
+
+    def finish_proposal_item(self, proposal_id: str, seq: int, *, status: str,
+                             reason: str = "", result_id: str = "") -> None:
+        with self._tx() as c:
+            c.execute(
+                "UPDATE memory_proposal_items SET status=?, reason=?, result_id=?, "
+                "updated_at=? WHERE proposal_id=? AND seq=?",
+                (status, reason[:300], result_id, now_iso(), proposal_id, int(seq)),
+            )
+
+    def set_proposal_status(self, proposal_id: str, status: str, *,
+                            result: dict | None = None) -> None:
+        with self._tx() as c:
+            c.execute(
+                "UPDATE memory_proposals SET status=?, result=?, applied_at=? "
+                "WHERE id=?",
+                (status, json.dumps(result or {}, ensure_ascii=False),
+                 now_iso() if status == "applied" else None, proposal_id),
+            )
+
+    def pending_proposal_count(self) -> int:
+        with self._lock:
+            return int(self._conn.execute(
+                "SELECT COUNT(*) FROM memory_proposals WHERE status='pending'"
+            ).fetchone()[0])
+
     # -- 向量 ---------------------------------------------------------------- #
 
-    def put_embedding(self, record_id: str, model: str, vector: list[float]) -> None:
+    def put_embedding(self, record_id: str, model: str, vector: list[float],
+                      *, version: str = "") -> None:
         if not vector:
             return
         blob = struct.pack(f"<{len(vector)}f", *vector)
         with self._tx() as c:
             c.execute(
                 "INSERT OR REPLACE INTO memory_embeddings("
-                "record_id, model, dim, vector, updated_at) VALUES(?,?,?,?,?)",
-                (record_id, model, len(vector), blob, now_iso()),
+                "record_id, model, version, dim, vector, updated_at) "
+                "VALUES(?,?,?,?,?,?)",
+                (record_id, model, str(version or ""), len(vector), blob, now_iso()),
+            )
+            c.execute(
+                "UPDATE memory_records SET embedding_model=?, embedding_version=? "
+                "WHERE id=?",
+                (model, str(version or ""), record_id),
             )
 
     def get_embedding(self, record_id: str) -> list[float] | None:
@@ -1510,6 +1874,119 @@ class MemoryStore:
                 "WHERE r.status='active'"
             ).fetchone()[0]
         return {"active": int(active), "covered": int(covered)}
+
+    def vector_health(self, meta: dict | None = None) -> dict:
+        """向量健康表：当前型号能用的多少条、需要重建的多少条。
+
+        `meta` = {"model":..., "version":..., "dim":...}；只给 model 时版本不参与比较。
+        """
+        meta = dict(meta or {})
+        want_model = str(meta.get("model") or "")
+        want_version = str(meta.get("version") or "")
+        want_dim = int(meta.get("dim") or 0)
+        with self._lock:
+            active = int(self._conn.execute(
+                "SELECT COUNT(*) FROM memory_records WHERE status='active'"
+            ).fetchone()[0])
+            rows = self._conn.execute(
+                "SELECT e.model, e.version, e.dim FROM memory_embeddings e "
+                "JOIN memory_records r ON r.id = e.record_id "
+                "WHERE r.status='active'"
+            ).fetchall()
+        covered = len(rows)
+        matching = 0
+        for row in rows:
+            if want_model and str(row["model"] or "") != want_model:
+                continue
+            if want_version and str(row["version"] or "") != want_version:
+                continue
+            if want_dim and int(row["dim"] or 0) != want_dim:
+                continue
+            matching += 1
+        return {
+            "active": active,
+            "covered": covered,
+            "matching": matching,
+            "stale": max(0, covered - matching),
+            "missing": max(0, active - covered),
+            "model": want_model,
+            "version": want_version,
+            "dim": want_dim,
+        }
+
+    def list_stale_embeddings(self, meta: dict | None = None,
+                              *, limit: int = 50) -> list[dict]:
+        """型号/版本/维度对不上的向量：这些要重建。"""
+        meta = dict(meta or {})
+        want_model = str(meta.get("model") or "")
+        want_version = str(meta.get("version") or "")
+        want_dim = int(meta.get("dim") or 0)
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT r.id, r.content, e.model, e.version, e.dim "
+                "FROM memory_records r JOIN memory_embeddings e ON e.record_id=r.id "
+                "WHERE r.status='active' ORDER BY r.asserted_at DESC"
+            ).fetchall()
+        out = []
+        for row in rows:
+            if want_model and str(row["model"] or "") != want_model:
+                out.append(dict(row))
+            elif want_version and str(row["version"] or "") != want_version:
+                out.append(dict(row))
+            elif want_dim and int(row["dim"] or 0) != want_dim:
+                out.append(dict(row))
+            if limit and len(out) >= int(limit):
+                break
+        return out
+
+    def _semantic_candidates(
+        self, owner_id: str, view: list[tuple[str, str]],
+        vector: list[float], *, meta: dict | None = None,
+        limit: int = 2000, min_cos: float = 0.30,
+    ) -> tuple[list[tuple[float, dict]], int]:
+        """语义通道独立召回：不走 FTS，直接扫向量。
+
+        返回 (按余弦降序的 [(cos, 记录)], 型号不符的条数)。
+        """
+        if not vector or not view:
+            return [], 0
+        meta = dict(meta or {})
+        want_model = str(meta.get("model") or "")
+        want_version = str(meta.get("version") or "")
+        dim = len(vector)
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT record_id, model, version, dim, vector FROM memory_embeddings"
+            ).fetchall()
+        scored: list[tuple[float, str]] = []
+        mismatch = 0
+        for row in rows:
+            if int(row["dim"] or 0) != dim:
+                mismatch += 1
+                continue
+            if want_model and str(row["model"] or "") != want_model:
+                mismatch += 1
+                continue
+            if want_version and str(row["version"] or "") != want_version:
+                mismatch += 1
+                continue
+            try:
+                emb = list(struct.unpack(f"<{row['dim']}f", row["vector"]))
+            except (struct.error, TypeError):
+                mismatch += 1
+                continue
+            cos = _cosine(vector, emb)
+            if cos >= min_cos:
+                scored.append((cos, row["record_id"]))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        keep = scored[: max(1, int(limit))]
+        authorized = self._fetch_authorized([rid for _, rid in keep], owner_id, view)
+        out: list[tuple[float, dict]] = []
+        for cos, rid in keep:
+            rec = authorized.get(rid)
+            if rec:
+                out.append((cos, rec))
+        return out, mismatch
 
     # -- 检索 ---------------------------------------------------------------- #
 
@@ -1719,10 +2196,18 @@ class MemoryStore:
         min_score: float = 2.5,
         candidate_limit: int = 2000,
         vector: list[float] | None = None,
+        vector_meta: dict | None = None,
+        semantic_min: float = 0.30,
         mmr: bool = True,
         mmr_lambda: float = 0.7,
         stats: dict | None = None,
     ) -> list[dict]:
+        """混合检索：词法与语义各召回各的，再用 RRF 融合。
+
+        改前的写法是「先 FTS 取候选、再在候选里算 cosine」，语义完全被词法卡住；
+        现在两路独立成池，语义通道自己扫向量（带型号校验），最后按
+        `Σ 1/(60+rank)` 排序。没有查询向量时行为与旧版一致。
+        """
         stats = stats if stats is not None else {}
         query = (query or "").strip()
         if not query:
@@ -1732,7 +2217,11 @@ class MemoryStore:
             return []
         latin, grams = tokenize(query)
         terms = index_terms(query)
+        raw = query.lower()
+
+        # --- 词法通道 ---
         truncated = False
+        lexical_rank: dict[str, int] = {}
         if self._fts_ok and terms:
             cands, truncated = self._fts_candidates(
                 owner_id, view, terms, candidate_limit
@@ -1741,18 +2230,54 @@ class MemoryStore:
             cands = []  # 查询里全是虚词，没有可检索的证据
         else:
             cands = self._candidates(owner_id, view, candidate_limit)
-        weights = self._idf_weights(terms) if cands else {}
-        raw = query.lower()
-        scored = []
+        for i, rec in enumerate(cands, 1):
+            lexical_rank[rec["id"]] = i
+
+        # --- 语义通道（独立召回，不经词法筛选）---
+        sem_items: list[tuple[float, dict]] = []
+        vector_mismatch = 0
+        semantic_rank: dict[str, int] = {}
+        if vector:
+            sem_items, vector_mismatch = self._semantic_candidates(
+                owner_id, view, vector,
+                meta=vector_meta, limit=candidate_limit, min_cos=semantic_min,
+            )
+            for i, (_cos, rec) in enumerate(sem_items, 1):
+                semantic_rank[rec["id"]] = i
+
+        # --- 合池打分 ---
+        pool: dict[str, dict] = {}
         for rec in cands:
+            pool[rec["id"]] = rec
+        for _cos, rec in sem_items:
+            pool.setdefault(rec["id"], rec)
+        weights = self._idf_weights(terms) if cands else {}
+        scored = []
+        for rec in pool.values():
             if rec.get("kind") == "state":
                 continue  # 工作状态走独立注入段，不再参与召回排序
             s = self._score(rec, latin, grams, raw, vector, weights)
             if s >= min_score:
                 scored.append((s, rec))
-        scored.sort(key=lambda x: (x[0], x[1].get("asserted_at") or ""), reverse=True)
+
+        # --- 融合排序 ---
+        use_rrf = bool(semantic_rank) and len(scored) > 1
+        if use_rrf:
+            scored.sort(
+                key=lambda x: (
+                    _rrf_score([lexical_rank.get(x[1]["id"]),
+                                semantic_rank.get(x[1]["id"])]),
+                    x[0],
+                    x[1].get("asserted_at") or "",
+                ),
+                reverse=True,
+            )
+        else:
+            scored.sort(key=lambda x: (x[0], x[1].get("asserted_at") or ""),
+                        reverse=True)
         top_k = max(1, int(limit))
-        if mmr and len(scored) > 1:
+        used_mmr = bool(mmr and len(scored) > 1)
+        if used_mmr:
             chosen = self._mmr_select(scored, top_k, mmr_lambda)
         else:
             chosen = scored[:top_k]
@@ -1762,14 +2287,37 @@ class MemoryStore:
             rec["_score"] = round(s, 3)
             rec["source_ids"] = json.loads(rec.get("source_ids") or "[]")
             out.append(rec)
+
+        if truncated:
+            truncated_reason = "candidate_limit"
+        elif not out:
+            truncated_reason = "no_match"
+        elif len(scored) > len(out):
+            truncated_reason = "top_k"
+        else:
+            truncated_reason = ""
+        meta = dict(vector_meta or {})
         stats.update(
             {
-                "mode": "fts" if (self._fts_ok and terms) else "scan",
-                "candidates": len(cands),
+                "mode": (
+                    "hybrid" if (semantic_rank and (self._fts_ok and terms or cands))
+                    else "semantic" if semantic_rank
+                    else "fts" if (self._fts_ok and terms)
+                    else "scan"
+                ),
+                "candidates": len(pool),
+                "lexical_candidates": len(cands),
+                "semantic_candidates": len(sem_items),
                 "matched": len(scored),
+                "injected": len(out),
+                "rrf": use_rrf,
+                "vector_model": str(meta.get("model") or ""),
+                "vector_version": str(meta.get("version") or ""),
+                "vector_mismatch": vector_mismatch,
                 "truncated": truncated,
+                "truncated_reason": truncated_reason,
                 "candidate_limit": int(candidate_limit),
-                "mmr": bool(mmr and len(scored) > 1),
+                "mmr": used_mmr,
             }
         )
         return out
@@ -1786,6 +2334,7 @@ class MemoryStore:
         owner: dict | None = None,
         query: str = "",
         vector: list[float] | None = None,
+        vector_meta: dict | None = None,
         cfg: dict | None = None,
         degraded: str = "",
         receipt: str = "",
@@ -1922,6 +2471,8 @@ class MemoryStore:
                     min_score=min_score,
                     candidate_limit=int(cfg.get("candidate_limit", 2000)),
                     vector=vector,
+                    vector_meta=vector_meta,
+                    semantic_min=float(cfg.get("semantic_min", 0.30)),
                     mmr=bool(cfg.get("mmr_enable", True)),
                     mmr_lambda=float(cfg.get("mmr_lambda", 0.7)),
                     stats=search_stats,
@@ -2066,7 +2617,8 @@ class MemoryStore:
                 ),
                 "conflicts": one(
                     "SELECT COUNT(*) FROM memory_audit "
-                    "WHERE action='extract_conflict' AND ts >= ?",
+                    "WHERE action IN ('extract_conflict','reflect_conflict') "
+                    "AND ts >= ?",
                     (iso_days_ago(7),),
                 ),
                 "deletion_epoch": self.deletion_epoch(),
@@ -2179,6 +2731,28 @@ def _content_hash(text: str) -> str:
     return hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:32]
 
 
+def _payload_hash(payload: dict) -> str:
+    """操作负载指纹：同一个 op_key 换了内容就不再算「同一次操作」。"""
+    import hashlib
+
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
+
+def _rrf_score(ranks) -> float:
+    """Reciprocal Rank Fusion：Σ 1/(60 + rank)，缺一路就是 0 分。
+
+    rank 从 1 开始；`None` 表示这一路没有召回它。常数 60 是 RRF 的常用值，
+    作用是压住头部差距，让「两路都进前几」比「一路第一」更值钱。
+    """
+    total = 0.0
+    for rank in ranks or ():
+        if rank is None:
+            continue
+        total += 1.0 / (60.0 + max(1, int(rank)))
+    return total
+
+
 def _cosine(a: list[float], b: list[float]) -> float:
     if not a or not b or len(a) != len(b):
         return 0.0
@@ -2194,5 +2768,5 @@ __all__ = [
     "MemoryStore", "MemoryError", "default_db_path", "tokenize", "term_set",
     "index_terms", "text_similarity", "fts_match_expr",
     "now_iso", "new_id", "KINDS", "EPISTEMIC_TYPES", "SCOPE_TYPES",
-    "CORE_SECTIONS", "EPISTEMIC_TAG", "SCHEMA_VERSION",
+    "CORE_SECTIONS", "EPISTEMIC_TAG", "SCHEMA_VERSION", "_rrf_score",
 ]

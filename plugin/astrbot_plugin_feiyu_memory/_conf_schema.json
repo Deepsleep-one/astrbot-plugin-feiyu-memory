@@ -47,6 +47,12 @@
     "hint": "默认 2.5。调高更保守（少答错往事），调低更容易翻出旧事。",
     "default": 2.5
   },
+  "semantic_min": {
+    "type": "float",
+    "description": "语义通道相似度门槛",
+    "hint": "默认 0.30。语义候选与词法候选各自召回后按 RRF 融合，这里是余弦相似度的最低值；调高更保守，调低更容易想起旧事。",
+    "default": 0.3
+  },
   "search_timeout_ms": {
     "type": "int",
     "description": "检索超时（毫秒）",

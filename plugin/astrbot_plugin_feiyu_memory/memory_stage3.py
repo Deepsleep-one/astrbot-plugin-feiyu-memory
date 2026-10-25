@@ -25,7 +25,6 @@ from .memory_core import (
     now_dt,
     now_iso,
     text_similarity,
-    tokenize,
 )
 
 CallLLM = Callable[[str, str, str], Awaitable[str]]
@@ -126,20 +125,107 @@ def _sensitive(text: str) -> bool:
     return any(p.search(text or "") for p in SENSITIVE_PATTERNS)
 
 
+_NEGATIONS = ("不", "没", "讨厌", "拒绝", "从不", "不再")
+
+# 证据必须落在主人的话里；助手自述再像也不是主人的事实。
+_SPEAKER_PREFIXES = (
+    ("主人说：", "owner"),
+    ("主人说:", "owner"),
+    ("主人：", "owner"),
+    ("主人:", "owner"),
+    ("助手说：", "assistant"),
+    ("助手说:", "assistant"),
+    ("助手：", "assistant"),
+    ("助手:", "assistant"),
+    ("大肥鱼说：", "assistant"),
+    ("大肥鱼说:", "assistant"),
+    ("大肥鱼：", "assistant"),
+    ("大肥鱼:", "assistant"),
+)
+
+
+def _polarity(text: str) -> int:
+    """粗判肯/否极性，只用来拦住「喜欢 / 不喜欢」这类整句翻转。"""
+    low = (text or "").lower()
+    return -1 if any(tok in low for tok in _NEGATIONS) else 1
+
+
+def _norm_map(text: str) -> tuple:
+    """归一化（去空白 + 小写），同时记下每个归一字回到原文的下标。"""
+    chars: list = []
+    index: list = []
+    for i, ch in enumerate(text or ""):
+        if ch.isspace():
+            continue
+        chars.append(ch.lower())
+        index.append(i)
+    return "".join(chars), index
+
+
+def _locate_span(evidence: str, text: str) -> tuple | None:
+    """在原文里逐字定位证据，返回原文坐标 (start, end)；定位不到返回 None。
+
+    只容忍空白差异：近义改写、否定改写一律不算「原文里说过」。
+    """
+    ev, _ = _norm_map(evidence)
+    if len(ev) < 4 or not (text or "").strip():
+        return None
+    body, index = _norm_map(text)
+    pos = body.find(ev)
+    if pos < 0:
+        return None
+    return index[pos], index[pos + len(ev) - 1] + 1
+
+
 def _evidence_supported(evidence: str, transcript: str) -> bool:
-    """证据必须能在原始对话里找到（允许少量标点/空白差异）。"""
-    ev = _norm(evidence)
-    tr = _norm(transcript)
-    if len(ev) < 4 or not tr:
+    """证据必须是对话原文的一部分，不许用相似度冒充。"""
+    return _locate_span(evidence, transcript) is not None
+
+
+def _parse_transcript_messages(transcript: str) -> list:
+    """把「主人：…/助手：…」拆成带说话人的消息。
+
+    一条前缀都认不出来时返回空列表，交给调用方按「单说话者」处理（兼容旧调用）。
+    """
+    messages: list = []
+    unknown: list = []
+    for line in (transcript or "").splitlines():
+        body = line.strip()
+        if not body:
+            continue
+        for prefix, role in _SPEAKER_PREFIXES:
+            if body.startswith(prefix):
+                messages.append({"role": role, "text": body[len(prefix):].strip()})
+                break
+        else:
+            unknown.append(body)
+    if not messages:
+        return []
+    messages.extend({"role": "unknown", "text": body} for body in unknown)
+    return messages
+
+
+def _evidence_message(messages: list, evidence: str) -> tuple:
+    """找出证据落在哪条消息里；主人和助手都说过同一句时，优先算主人的。"""
+    for only_owner in (True, False):
+        for msg in messages:
+            if only_owner and msg.get("role") != "owner":
+                continue
+            span = _locate_span(evidence, msg.get("text", ""))
+            if span:
+                return msg, span
+    return None, None
+
+
+def _content_borrowed(messages: list, content: str) -> bool:
+    """候选内容只出现在助手嘴里而主人没说过 —— 那它就不是主人的事实。"""
+    needle = _norm(content)
+    if len(needle) < 2:
         return False
-    if ev in tr:
-        return True
-    # 模型常常会改一两个标点或省略主语，用二元组覆盖率兜底。
-    _, grams = tokenize(evidence)
-    if not grams:
-        return False
-    hit = sum(1 for g in grams if g in tr)
-    return hit / len(grams) >= 0.8
+    roles = {
+        msg.get("role") for msg in messages if needle in _norm(msg.get("text", ""))
+    }
+    return roles == {"assistant"}
 
 
 def _sanitize_fact_key(key: str) -> str:
@@ -243,6 +329,11 @@ class Stage3:
             "session_id": session_id or "",
             "user": compact(user_text, 1200),
             "assistant": compact(assistant_text, 1200),
+            # 结构化的一轮对话：提取时据此判定证据是谁说的，而不是靠字符串前缀。
+            "turns": [
+                {"role": "owner", "text": compact(user_text, 1200)},
+                {"role": "assistant", "text": compact(assistant_text, 1200)},
+            ],
             "ts": now_iso(),
             "epoch": self.store.deletion_epoch(),
         }
@@ -313,6 +404,30 @@ class Stage3:
             f"助手：{job['payload'].get('assistant', '')}"
             for job in jobs
         )
+        turns: list = []
+        for job in jobs:
+            payload = job.get("payload") or {}
+            stored = payload.get("turns")
+            if isinstance(stored, list) and stored:
+                for item in stored:
+                    if isinstance(item, dict) and str(item.get("text") or "").strip():
+                        turns.append({
+                            "role": item.get("role") or "unknown",
+                            "text": str(item.get("text")),
+                            "job": job["id"],
+                        })
+            else:
+                # 老队列里的 payload 没有 turns，按「主人 + 助手」两条补回来。
+                if str(payload.get("user") or "").strip():
+                    turns.append({
+                        "role": "owner", "text": str(payload.get("user")), "job": job["id"],
+                    })
+                if str(payload.get("assistant") or "").strip():
+                    turns.append({
+                        "role": "assistant",
+                        "text": str(payload.get("assistant")),
+                        "job": job["id"],
+                    })
         raw = await self.call_llm(
             EXTRACT_SYSTEM, transcript, self._str("extract_model", "")
         )
@@ -324,7 +439,8 @@ class Stage3:
                 break
             try:
                 rec = self._write_candidate(
-                    cand, owner_id, platform, bot_instance, transcript, jobs[0]
+                    cand, owner_id, platform, bot_instance, transcript, jobs[0],
+                    messages=turns,
                 )
             except MemoryError as exc:
                 skipped += 1
@@ -352,6 +468,7 @@ class Stage3:
         bot_instance: str,
         transcript: str,
         job: dict,
+        messages: list | None = None,
     ) -> dict | None:
         kind = str(cand.get("kind", "")).strip().lower()
         if kind not in EXTRACT_KINDS:
@@ -369,21 +486,59 @@ class Stage3:
         if confidence < min_conf:
             raise MemoryError(f"置信度 {confidence:.2f} 低于 {min_conf:.2f}")
         evidence = str(cand.get("evidence", "")).strip()
-        if not evidence or not _evidence_supported(evidence, transcript):
+        if not evidence:
             raise MemoryError("证据无法在原对话中定位")
+
+        # 证据归属：必须落在主人自己说的话里。旧调用没有结构化 messages 时，
+        # 从带前缀的 transcript 还原；连前缀都认不出才按单说话者兼容。
+        turns = messages if messages is not None else _parse_transcript_messages(transcript)
+        single = not turns
+        if single:
+            turns = [{"role": "owner", "text": transcript or ""}]
+        msg, span = _evidence_message(turns, evidence)
+        if msg is None:
+            raise MemoryError("证据无法在原对话中定位")
+        if msg.get("role") != "owner":
+            raise MemoryError("证据属于助手自述，不能当作主人的事实")
+        if not single and _content_borrowed(turns, content):
+            raise MemoryError("证据属于助手自述，不能当作主人的事实")
         if _sensitive(evidence):
             raise MemoryError("证据命中敏感信息")
+
+        # 旧材料抑制：主人要求忘掉过的内容，不许被同一段旧对话重新提取回来。
+        for text in (content, evidence):
+            if self.store.tombstoned(text):
+                self.store.audit(
+                    "tombstone_block",
+                    actor="extractor",
+                    detail=compact(content, 60),
+                )
+                raise MemoryError("这条内容已被主人要求遗忘，不再重新记入")
 
         scope_hint = str(cand.get("scope", "private")).strip().lower()
         scope_type = "owner_public" if (
             scope_hint == "public" and self._bool("allow_auto_public", False)
         ) else "owner_private"
 
-        # 重复检测：用派生索引找同主题候选，不再只看最近 200 条。
+        # 重复检测：完全一致才算重复；高度相似时先看极性，反话不能被当成重复吞掉。
         for rec in self.store.find_similar(owner_id, content, limit=40):
             if _norm(rec["content"]) == _norm(content):
                 raise MemoryError("与已有记录重复")
-            if float(rec.get("similarity") or 0) >= 0.85:
+            similarity = float(rec.get("similarity") or 0)
+            if similarity < 0.6:
+                continue
+            if _polarity(rec["content"]) != _polarity(content):
+                self.store.audit(
+                    "extract_conflict",
+                    actor="extractor",
+                    record_id=rec["id"],
+                    detail=(
+                        "极性相反的近似观察，待确认："
+                        f"{compact(rec['content'], 60)} | {compact(content, 60)}"
+                    ),
+                )
+                raise MemoryError("与已有记录极性相反，已记为待确认冲突")
+            if similarity >= 0.85:
                 raise MemoryError("与已有记录高度相似")
 
         fact_key = _sanitize_fact_key(str(cand.get("fact_key", "")))
@@ -432,8 +587,12 @@ class Stage3:
             source_ids=[str(job["id"])],
             evidence=[{
                 "kind": "dialogue",
-                "ref": f"job:{job['id']}",
+                "ref": f"job:{job['id']}#m{next((i for i, t in enumerate(turns) if t is msg), 0)}",
                 "excerpt": evidence[:500],
+                "speaker": "owner",
+                "content_hash": hashlib.sha256(evidence.encode("utf-8")).hexdigest()[:32],
+                "span_start": span[0],
+                "span_end": span[1],
             }],
             # 幂等键：同一轮对话重跑（任务重试、批次重复投递）不会写第二条，
             # 也不用靠 0.85 相似度去猜——那会把「吃了麻辣香锅」和「吃了酸菜鱼」判成同一条。

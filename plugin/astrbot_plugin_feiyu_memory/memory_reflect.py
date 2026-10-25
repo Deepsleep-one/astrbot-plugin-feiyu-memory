@@ -101,6 +101,15 @@ def _overlap(a: str, b: str) -> float:
     return len(sa & sb) / min(len(sa), len(sb))
 
 
+_NEGATIONS = ("不", "没", "讨厌", "拒绝", "从不", "不再")
+
+
+def _polarity(text: str) -> int:
+    """粗判肯/否极性：「喜欢」和「不喜欢」只差一个字，意思却相反。"""
+    low = (text or "").lower()
+    return -1 if any(tok in low for tok in _NEGATIONS) else 1
+
+
 def parse_reflection(raw: str) -> list[dict]:
     """解析模型输出；任何异常都返回空列表（宁可不整理）。"""
     text = _strip_fences(raw)
@@ -191,82 +200,267 @@ class MemoryReflector:
 
     # -- 主流程 -------------------------------------------------------- #
 
-    async def run(self, *, force: bool = False) -> dict:
-        """整理一轮；``force=True`` 时忽略时间窗与「今天已整理过」。"""
-        result = {
-            "ok": False, "reason": "", "deduped": 0, "merged": 0, "dropped": 0,
-            "candidates": 0,
-        }
-        if not self._bool("reflect_enable", True):
-            result["reason"] = "未开启"
-            return result
-        if not self.store.capture_enabled():
-            result["reason"] = "记录已暂停"
-            return result
-
-        now = now_dt()
-        today = now.strftime("%Y-%m-%d")
-        hour = min(23, max(0, self._int("reflect_hour", 4)))
-        if not force:
-            if now.hour < hour:
-                result["reason"] = "还没到点"
-                return result
-            if (self.store.get_control("last_reflect_date", "") or "") == today:
-                result["reason"] = "今天已整理"
-                return result
-
-        owner_id = self._owner_id()
-        days = max(1, self._int("reflect_days", 30))
-        limit = max(4, self._int("reflect_batch", 120))
+    def _candidates_of(self, owner_id: str, days: int, limit: int) -> list[dict]:
         recs = self.store.list_records(
             owner_id=owner_id,
             kinds=list(REFLECT_KINDS),
             since=iso_days_ago(days),
             limit=limit,
         )
-        recs = [
+        return [
             r for r in recs
             if r.get("scope_type") == "owner_private" and not _sensitive(r.get("content", ""))
         ]
-        result["candidates"] = len(recs)
-        if len(recs) < max(2, self._int("reflect_min_records", 4)):
-            result["reason"] = f"素材不足（{len(recs)} 条）"
-            result["ok"] = True
-            self._finish(today, result)
+
+    async def run(self, *, force: bool = False) -> dict:
+        """整理一轮：先出提案，复核通过再应用。
+
+        两段式的好处是「模型想做什么」和「库里真的变了什么」各留一份证据；
+        应用阶段还会再核一次来源，避免提案时有效、落库时已经失效。
+        """
+        result = {
+            "ok": False, "reason": "", "deduped": 0, "merged": 0, "dropped": 0,
+            "candidates": 0, "proposal_id": "",
+        }
+        prop = await self.propose(force=force)
+        result["reason"] = prop.get("reason", "")
+        result["candidates"] = int(prop.get("candidates") or 0)
+        result["dropped"] = int(prop.get("dropped_at_plan") or 0)
+        if not prop.get("ok"):
             return result
-
-        # 一、删重复：不做任何改写，只归档同义重复。
-        try:
-            deduped, dropped = self._dedupe(recs)
-            result["deduped"] = deduped
-            result["dropped"] += dropped
-        except Exception as exc:
-            result["reason"] = f"删重复失败：{type(exc).__name__}: {exc}"
-            self._log("warning", "[feiyu-memory] 整理去重失败：%s", exc)
-
-        # 二、归纳：说法相近的零散观察合并成一句（去重后重新取一遍，别拿旧的列表）。
-        try:
-            fresh = self.store.list_records(
-                owner_id=owner_id,
-                kinds=list(REFLECT_KINDS),
-                since=iso_days_ago(days),
-                limit=limit,
-            )
-            fresh = [
-                r for r in fresh
-                if r.get("scope_type") == "owner_private"
-                and not _sensitive(r.get("content", ""))
-            ]
-            merged, dropped = await self._fold(owner_id, fresh, today)
-            result["merged"] = merged
-            result["dropped"] += dropped
-        except Exception as exc:
-            result["reason"] = f"归纳失败：{type(exc).__name__}: {exc}"
-            self._log("warning", "[feiyu-memory] 整理归纳失败：%s", exc)
-
+        proposal_id = prop.get("proposal_id") or ""
+        if proposal_id:
+            applied = await self.apply(proposal_id)
+            result["proposal_id"] = proposal_id
+            result["deduped"] = int(applied.get("archived") or 0)
+            result["merged"] = int(applied.get("merged") or 0)
+            result["dropped"] += int(applied.get("dropped") or 0)
         result["ok"] = True
-        self._finish(today, result)
+        self._finish(prop.get("today") or now_dt().strftime("%Y-%m-%d"), result)
         return result
+
+    async def propose(self, *, force: bool = False) -> dict:
+        """只做计划、不写记录：产出一份可复核的提案。"""
+        today = now_dt().strftime("%Y-%m-%d")
+        out = {
+            "ok": False, "reason": "", "proposal_id": "", "status": "",
+            "items": [], "candidates": 0, "today": today,
+        }
+        if not self._bool("reflect_enable", True):
+            out["reason"] = "未开启"
+            return out
+        if not self.store.capture_enabled():
+            out["reason"] = "记录已暂停"
+            return out
+
+        now = now_dt()
+        hour = min(23, max(0, self._int("reflect_hour", 4)))
+        if not force:
+            if now.hour < hour:
+                out["reason"] = "还没到点"
+                return out
+            if (self.store.get_control("last_reflect_date", "") or "") == today:
+                out["reason"] = "今天已整理"
+                return out
+
+        owner_id = self._owner_id()
+        days = max(1, self._int("reflect_days", 30))
+        limit = max(4, self._int("reflect_batch", 120))
+        recs = self._candidates_of(owner_id, days, limit)
+        out["candidates"] = len(recs)
+        if len(recs) < max(2, self._int("reflect_min_records", 4)):
+            out["reason"] = f"素材不足（{len(recs)} 条）"
+            out["ok"] = True
+            self._finish(today, {"candidates": len(recs)})
+            return out
+
+        archives = self._plan_dedupe(recs)
+        folds, dropped = await self._plan_fold(
+            owner_id, self._candidates_of(owner_id, days, limit), today
+        )
+        items = archives + folds
+        if not items:
+            out["reason"] = "这轮没有可整理的"
+            out["ok"] = True
+            out["dropped_at_plan"] = dropped
+            self._finish(today, {"candidates": len(recs)})
+            return out
+
+        manifest = {
+            "today": today,
+            "candidates": len(recs),
+            "archives": len(archives),
+            "folds": len(folds),
+            "dropped_at_plan": dropped,
+            "dedupe_threshold": self._float("reflect_dedupe", 0.88),
+            "fold_threshold": self._float("reflect_fold", 0.45),
+        }
+        prop = self.store.save_proposal(
+            owner_id, items, kind="reflect_fold", manifest=manifest
+        )
+        try:
+            self.store.audit(
+                "reflect_propose", actor="system",
+                detail=(
+                    f"提案 {prop.get('id', '')}：归档 {len(archives)} 条，"
+                    f"归纳 {len(folds)} 条"
+                ),
+            )
+        except Exception:
+            pass
+        out.update(
+            {
+                "ok": True,
+                "proposal_id": prop.get("id", ""),
+                "status": prop.get("status", "pending"),
+                "items": prop.get("items", []),
+                "dropped_at_plan": dropped,
+            }
+        )
+        return out
+
+    async def apply(self, proposal_id: str) -> dict:
+        """应用提案里的每一项，逐项留回执；来源失效的不硬写。"""
+        out = {
+            "ok": False, "reason": "", "archived": 0, "merged": 0, "dropped": 0,
+            "skipped": 0, "applied": 0,
+        }
+        prop = self.store.get_proposal(proposal_id)
+        if prop is None:
+            out["reason"] = "提案不存在"
+            return out
+        if prop.get("status") != "pending":
+            out["reason"] = f"提案状态为 {prop.get('status')}，不重复应用"
+            out["ok"] = True
+            return out
+        owner_id = prop.get("owner_id") or self._owner_id()
+        today = str(
+            (prop.get("manifest") or {}).get("today") or now_dt().strftime("%Y-%m-%d")
+        )
+        for item in prop.get("items") or []:
+            payload = dict(item.get("payload") or {})
+            op = str(item.get("op") or payload.get("op") or "")
+            seq = int(item.get("seq") or 0)
+            try:
+                if op == "archive":
+                    keep = str(payload.get("keep_id") or "")
+                    drop = str(payload.get("record_id") or item.get("record_id") or "")
+                    merged = self.store.merge_records(
+                        keep, [drop], reason="reflect_dedupe"
+                    )
+                    if merged:
+                        out["archived"] += merged
+                        out["applied"] += 1
+                        self.store.finish_proposal_item(
+                            proposal_id, seq, status="applied", result_id=keep
+                        )
+                    else:
+                        out["skipped"] += 1
+                        self.store.finish_proposal_item(
+                            proposal_id, seq, status="skipped",
+                            reason="记录已不是 active，跳过归档",
+                        )
+                    continue
+                if op == "fold":
+                    status, reason, result_id = self._apply_fold(
+                        owner_id, today, payload
+                    )
+                    self.store.finish_proposal_item(
+                        proposal_id, seq, status=status, reason=reason,
+                        result_id=result_id,
+                    )
+                    if status == "applied":
+                        out["applied"] += 1
+                        out["merged"] += 1
+                        if self.after_write is not None:
+                            try:
+                                self.after_write(result_id, payload.get("content", ""))
+                            except Exception:
+                                pass
+                    elif status == "dropped":
+                        out["dropped"] += 1
+                    else:
+                        out["skipped"] += 1
+                    continue
+                out["skipped"] += 1
+                self.store.finish_proposal_item(
+                    proposal_id, seq, status="skipped", reason=f"未知操作 {op}"
+                )
+            except Exception as exc:
+                out["dropped"] += 1
+                self._log("warning", "[feiyu-memory] 应用提案项失败：%s", exc)
+                try:
+                    self.store.finish_proposal_item(
+                        proposal_id, seq, status="dropped",
+                        reason=f"{type(exc).__name__}: {exc}",
+                    )
+                except Exception:
+                    pass
+        out["ok"] = True
+        self.store.set_proposal_status(proposal_id, "applied", result=out)
+        try:
+            self.store.audit(
+                "proposal_apply", actor="system",
+                detail=(
+                    f"提案 {proposal_id}：应用 {out['applied']} 项，"
+                    f"归档 {out['archived']} 条，归纳 {out['merged']} 条，"
+                    f"丢弃 {out['dropped']} 项"
+                )[:500],
+            )
+        except Exception:
+            pass
+        return out
+
+    def _apply_fold(self, owner_id: str, today: str, payload: dict) -> tuple[str, str, str]:
+        """写一条归纳结果；返回 (状态, 回执原因, 新记录 id)。"""
+        use = [str(u) for u in (payload.get("use") or [])]
+        content = str(payload.get("content") or "")
+        kind = str(payload.get("kind") or "")
+        fact_key = str(payload.get("fact_key") or "")
+        if not use or len(use) < 2:
+            return "dropped", "来源不足两条", ""
+        expected = payload.get("revisions") or None
+        if isinstance(expected, dict):
+            expected = {str(k): int(v) for k, v in expected.items()}
+        else:
+            expected = None
+        ok, why = self.store.validate_sources(use, expected=expected)
+        if not ok:
+            return "dropped", f"来源失效：{why}", ""
+        if self.store.tombstoned(content):
+            return "dropped", "来源内容已被主人遗忘", ""
+        digest = payload.get("digest") or hashlib.sha1(
+            f"{today}|{fact_key}|{content}".encode("utf-8")
+        ).hexdigest()[:16]
+        try:
+            rec = self.store.add_record(
+                owner_id=owner_id,
+                kind=kind,
+                content=content,
+                fact_key=fact_key,
+                epistemic_type="derived",
+                scope_type="owner_private",
+                source_ids=list(use),
+                derived_from_ids=list(use),
+                importance=min(5, int(payload.get("importance") or 1)),
+                confidence=0.6,
+                created_by="reflect",
+                auto_supersede=True,
+                supersede_epistemic=REWRITABLE_EPISTEMIC,
+                op_key=f"reflect:{digest}",
+            )
+        except sqlite3.IntegrityError:
+            # 同一主题已经有主人本人确认的记录：归纳让位，不覆盖原话。
+            return "dropped", "同一主题已有主人确认的记录，归纳让位", ""
+        except Exception as exc:
+            return "dropped", f"写入失败：{type(exc).__name__}: {exc}", ""
+        if rec.get("_idempotent"):
+            return "skipped", "这条归纳之前已经写过", rec.get("id", "")
+        try:
+            self.store.merge_records(rec["id"], list(use), reason="reflect_fold")
+        except Exception as exc:
+            self._log("debug", "[feiyu-memory] 归纳归档失败：%s", exc)
+        return "applied", "", rec.get("id", "")
 
     def _finish(self, today: str, result: dict) -> None:
         self.store.set_control("last_reflect_date", today, actor="system")
@@ -286,8 +480,8 @@ class MemoryReflector:
 
     # -- 一、去重 ------------------------------------------------------ #
 
-    def _dedupe(self, recs: list[dict]) -> tuple[int, int]:
-        """同一 (类别, 说法来源) 下高度相似的记录只留最新一条。"""
+    def _plan_dedupe(self, recs: list[dict]) -> list[dict]:
+        """同一 (类别, 说法来源) 下高度相似的记录只留最新一条——只出计划。"""
         threshold = max(0.5, min(0.99, self._float("reflect_dedupe", 0.88)))
         groups: dict[tuple, list[dict]] = {}
         for rec in recs:
@@ -299,8 +493,7 @@ class MemoryReflector:
             )
             groups.setdefault(key, []).append(rec)
 
-        archives = 0
-        dropped = 0
+        items: list[dict] = []
         for group in groups.values():
             if len(group) < 2:
                 continue
@@ -312,20 +505,62 @@ class MemoryReflector:
             kept: list[dict] = []
             for rec in group:
                 same = None
+                conflict = None
                 for cand in kept:
-                    if _norm(cand["content"]) == _norm(rec["content"]) \
-                            or _overlap(cand["content"], rec["content"]) >= threshold:
+                    if _norm(cand["content"]) == _norm(rec["content"]):
+                        # 逐字一致就是同一条，不管是谁说的。
                         same = cand
                         break
+                    if (
+                        cand.get("epistemic_type") == "owner_asserted"
+                        and rec.get("epistemic_type") == "owner_asserted"
+                    ):
+                        # 主人自己的原话只做逐字去重，措辞相近不算重复。
+                        continue
+                    if _overlap(cand["content"], rec["content"]) < threshold:
+                        continue
+                    if _polarity(cand["content"]) != _polarity(rec["content"]):
+                        conflict = cand
+                        break
+                    same = cand
+                    break
+                if conflict is not None:
+                    # 措辞相近但一肯一否：这是两个说法，不是重复，留着等主人确认。
+                    self.store.audit(
+                        "reflect_conflict",
+                        record_id=conflict["id"],
+                        detail=(
+                            "极性相反但措辞相近，不合并："
+                            f"{compact(conflict['content'], 60)} | {compact(rec['content'], 60)}"
+                        ),
+                    )
+                    kept.append(rec)
+                    continue
                 if same is None:
                     kept.append(rec)
                     continue
-                merged = self.store.merge_records(
-                    same["id"], [rec["id"]], reason="reflect_dedupe"
+                items.append(
+                    {
+                        "op": "archive",
+                        "record_id": rec["id"],
+                        "keep_id": same["id"],
+                        "reason": "reflect_dedupe",
+                        "content": rec.get("content", ""),
+                    }
                 )
-                archives += merged
-                if not merged:
-                    dropped += 1
+        return items
+
+    def _dedupe(self, recs: list[dict]) -> tuple[int, int]:
+        """执行去重计划；返回 (归档条数, 失败条数)。"""
+        archives = 0
+        dropped = 0
+        for item in self._plan_dedupe(recs):
+            merged = self.store.merge_records(
+                item["keep_id"], [item["record_id"]], reason="reflect_dedupe"
+            )
+            archives += merged
+            if not merged:
+                dropped += 1
         return archives, dropped
 
     # -- 二、归纳 ------------------------------------------------------ #
@@ -369,10 +604,13 @@ class MemoryReflector:
                     clusters.append(cluster)
         return clusters
 
-    async def _fold(self, owner_id: str, recs: list[dict], today: str) -> tuple[int, int]:
+    async def _plan_fold(
+        self, owner_id: str, recs: list[dict], today: str
+    ) -> tuple[list[dict], int]:
+        """让模型出归纳方案，逐条校验后只返回计划，不写库。"""
         clusters = self._cluster(recs)
         min_fold = max(2, self._int("reflect_min_fold", 2))
-        total_merged = 0
+        items: list[dict] = []
         dropped = 0
         for cluster in clusters:
             if len(cluster) < min_fold:
@@ -415,47 +653,54 @@ class MemoryReflector:
                     # 词面几乎没有重合：多半是模型自己编的，不要写进库。
                     dropped += 1
                     continue
+                # 落库前复核：这中间来源可能已被主人改过、取代、或者要求忘掉。
+                ok, why = self.store.validate_sources(
+                    use,
+                    expected={u: int(by_id[u].get("revision") or 0) for u in use},
+                )
+                if not ok:
+                    self._log("debug", "[feiyu-memory] 归纳放弃：%s", why)
+                    dropped += 1
+                    continue
+                if self.store.tombstoned(content):
+                    dropped += 1
+                    continue
                 importance = max(int(by_id[u].get("importance") or 1) for u in use)
                 digest = hashlib.sha1(
                     f"{today}|{fact_key}|{content}".encode("utf-8")
                 ).hexdigest()[:16]
-                try:
-                    rec = self.store.add_record(
-                        owner_id=owner_id,
-                        kind=kind,
-                        content=content,
-                        fact_key=item["fact_key"] or fact_key,
-                        epistemic_type="derived",
-                        scope_type="owner_private",
-                        source_ids=list(use),
-                        derived_from_ids=list(use),
-                        importance=min(5, importance),
-                        confidence=0.6,
-                        created_by="reflect",
-                        auto_supersede=True,
-                        supersede_epistemic=REWRITABLE_EPISTEMIC,
-                        op_key=f"reflect:{digest}",
-                    )
-                except sqlite3.IntegrityError:
-                    # 同一主题已经有主人本人确认的记录：归纳让位，不覆盖原话。
-                    dropped += 1
-                    continue
-                except Exception as exc:
-                    self._log("warning", "[feiyu-memory] 整理写入失败：%s", exc)
-                    dropped += 1
-                    continue
-                if rec.get("_idempotent"):
-                    continue
-                # 归纳出来的这条取代被它归纳的那几条（不动主人原话）。
-                try:
-                    self.store.merge_records(rec["id"], list(use),
-                                             reason="reflect_fold")
-                except Exception as exc:
-                    self._log("debug", "[feiyu-memory] 归纳归档失败：%s", exc)
-                total_merged += 1
+                items.append(
+                    {
+                        "op": "fold",
+                        "record_id": "",
+                        "kind": kind,
+                        "content": content,
+                        "fact_key": item["fact_key"] or fact_key,
+                        "use": list(use),
+                        "revisions": {
+                            u: int(by_id[u].get("revision") or 0) for u in use
+                        },
+                        "importance": min(5, importance),
+                        "digest": digest,
+                    }
+                )
+        return items, dropped
+
+    async def _fold(
+        self, owner_id: str, recs: list[dict], today: str
+    ) -> tuple[int, int]:
+        """出方案并立刻执行（旧接口，保留给测试与单轮调用）。"""
+        items, dropped = await self._plan_fold(owner_id, recs, today)
+        merged = 0
+        for payload in items:
+            status, _reason, rec_id = self._apply_fold(owner_id, today, payload)
+            if status == "applied":
+                merged += 1
                 if self.after_write is not None:
                     try:
-                        self.after_write(rec["id"], content)
+                        self.after_write(rec_id, payload.get("content", ""))
                     except Exception:
                         pass
-        return total_merged, dropped
+            elif status == "dropped":
+                dropped += 1
+        return merged, dropped

@@ -153,7 +153,7 @@ astrbot-plugin-feiyu-memory/
 │   ├── memory_core.py                    # 记忆内核：表结构、权限过滤、检索、注入与墓碑
 │   ├── memory_stage3.py                  # 阶段三：工作状态、关系日记与后台自动提取
 │   ├── memory_reflect.py                 # 阶段四：记忆整理（删重复 / 归纳同主题）
-│   ├── metadata.yaml                     # 插件元信息（v0.4.0）
+│   ├── metadata.yaml                     # 插件元信息（v0.6.2）
 │   ├── _conf_schema.json                 # 配置面板 Schema
 │   └── persona_default.txt               # 内置人设正文
 ├── tools/
@@ -162,6 +162,9 @@ astrbot-plugin-feiyu-memory/
 │   ├── selftest.py                       # 离线自测（58 项，无需 AstrBot 与 QQ 环境）
 │   ├── selftest_stage3.py                # 阶段三自测（49 项：队列、证据校验、日记、状态）
 │   ├── selftest_stage4.py                # 阶段四自测（20 组：检索层、幂等、整理、向量与边界）
+│   ├── selftest_trust.py                 # 可信度回归（42 项：证据归属、否定、去重、多层失效）
+│   ├── selftest_recall.py                # 检索与操作协议回归（61 项：RRF、向量型号、CAS、提案、trace）
+│   ├── selftest_migrate.py               # 老库升级回归（18 项：用新代码打开旧库）
 │   └── import_check.py                   # 真实 AstrBot 环境导入与接口签名检查
 └── docs/
     ├── INSTALL.md                        # 安装部署、验收步骤与排障指南
@@ -173,6 +176,9 @@ astrbot-plugin-feiyu-memory/
 python tests/selftest.py          # 离线 58 项，覆盖权限、召回、纠正、忘记、备份、注入预算
 python tests/selftest_stage3.py   # 阶段三 49 项：队列门槛、证据校验、日记、状态、派生失效
 python tests/selftest_stage4.py   # 阶段四 20 组：FTS/idf/MMR、截断上报、幂等、整理与边界
+python tests/selftest_trust.py    # 可信度 42 项：只有主人原话能当证据、否定不被并、派生多层失效
+python tests/selftest_recall.py   # 检索 61 项：词法/语义各自召回 + RRF、向量型号校验、CAS、提案
+python tests/selftest_migrate.py  # 升级 18 项：新代码打开 v0.4/v0.5 形态的老库必须能起来
 ```
 
 - 开源仓库：`https://github.com/Deepsleep-one/astrbot-plugin-feiyu-memory`

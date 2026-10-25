@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 from pathlib import Path
 
 from astrbot.api import logger
@@ -51,7 +52,7 @@ KIND_BY_KEYWORD = [
     PLUGIN_NAME,
     "大肥鱼项目",
     "大肥鱼长期记忆联动：主人身份核验、分层记忆注入、显式记忆与纠正/忘记、证据与备份，附工作状态、关系日记、后台提取与记忆整理。",
-    "0.4.0",
+    "0.6.2",
     "https://github.com/Deepsleep-one/astrbot-plugin-feiyu-memory",
 )
 class FeiyuMemoryPlugin(Star):
@@ -64,6 +65,7 @@ class FeiyuMemoryPlugin(Star):
         self._embedding = None
         self._embedding_checked = False
         self._embedding_reason = ""
+        self._embedding_next_try = 0.0
         self._loop: asyncio.AbstractEventLoop | None = None
         self._bg_tasks: set[asyncio.Task] = set()
         self._stage3: Stage3 | None = None
@@ -167,6 +169,7 @@ class FeiyuMemoryPlugin(Star):
                 owner=ident["owner"],
                 query=event.get_message_str(),
                 vector=vector,
+                vector_meta=self._vector_meta(vector),
                 cfg=self._cfg_all(),
                 degraded=degraded,
                 receipt=receipt,
@@ -406,29 +409,55 @@ class FeiyuMemoryPlugin(Star):
                 if reflector is None:
                     yield event.plain_result("整理器没就绪，看看日志。")
                     return
+                # 先把上一轮还挂着的提案按回执应用掉，再出这一轮的新提案。
+                settled = 0
+                dropped_old = 0
+                try:
+                    for prop in reflector.store.list_proposals(
+                        status="pending", limit=5
+                    ):
+                        got = await reflector.apply(prop["id"])
+                        settled += int(got.get("applied") or 0)
+                        dropped_old += int(got.get("dropped") or 0)
+                except Exception as exc:
+                    logger.debug("[feiyu-memory] 应用遗留提案失败：%s", exc)
                 res = await reflector.run(force=True)
                 if not res.get("ok"):
                     yield event.plain_result(
                         f"这轮没整理：{res.get('reason', '不知道什么原因')}"
                     )
                     return
+                tail = ""
+                if settled or dropped_old:
+                    tail = (
+                        f"\n顺手应用了上一轮遗留的 {settled} 项提案"
+                        f"（丢弃 {dropped_old} 项）。"
+                    )
                 yield event.plain_result(
                     f"整理完了：看了 {res.get('candidates', 0)} 条，"
                     f"归档重复 {res.get('deduped', 0)} 条，"
                     f"归纳 {res.get('merged', 0)} 条，"
-                    f"丢弃 {res.get('dropped', 0)} 条。"
+                    f"丢弃 {res.get('dropped', 0)} 条。" + tail
                 )
             elif action in ("向量", "vector", "补向量"):
-                res = await self._backfill_vectors(limit=80)
+                rebuild = any(w in str(arg or "") for w in ("重建", "重算", "全部", "rebuild"))
+                res = await self._backfill_vectors(limit=200, rebuild=rebuild)
                 if not res.get("ok"):
                     yield event.plain_result(
                         f"没补成：{res.get('reason', '未知原因')}。\n"
                         f"关键词检索照常工作，只是没有语义召回。"
                     )
                     return
+                stale_line = ""
+                if res.get("stale"):
+                    stale_line = (
+                        f"\n另有 {res['stale']} 条向量型号/维度对不上"
+                        + ("（这轮已重算）。" if rebuild else "，要重算发 /feiyu 向量 重建。")
+                    )
                 yield event.plain_result(
                     f"向量覆盖：{res['covered']}/{res['active']} 条"
-                    f"（这次补了 {res['filled']} 条）。"
+                    f"（这次补了 {res['filled']} 条，重算 {res['rebuilt']} 条）。"
+                    + stale_line
                 )
             elif action in ("暂停", "pause"):
                 store.set_control("capture_enabled", "0", actor="owner")
@@ -485,6 +514,7 @@ class FeiyuMemoryPlugin(Star):
                     limit=limit,
                     min_score=self._cfg_float("recall_tool_min_score", 1.5),
                     vector=vector,
+                    vector_meta=self._vector_meta(vector),
                 ),
                 timeout=max(0.5, self._cfg_float("search_timeout_ms", 1200) / 1000.0),
             )
@@ -525,6 +555,7 @@ class FeiyuMemoryPlugin(Star):
             "/feiyu 提取 — 立刻处理待提取的对话\n"
             "/feiyu 整理 — 回看已有记忆：删重复、归纳同主题（不改主人原话）\n"
             "/feiyu 向量 — 给还没向量的记录补语义向量\n"
+            "/feiyu 向量 重建 — 换了嵌入模型后，把旧向量全部重算\n"
             "/feiyu 维护 — 重建检索索引（记忆本身不动）\n"
             "/feiyu 暂停 / 恢复"
         )
@@ -560,16 +591,31 @@ class FeiyuMemoryPlugin(Star):
             index_line = f"检索索引：可用但条数异常（{index_rows} 条，应用 /feiyu 维护 重建）"
         covered = s.get("covered", 0) or 0
         active = s.get("active", 0) or 0
+        health = store.vector_health(
+            {"model": self._embedding_name(), "version": self._embedding_version()}
+        )
+        stale = int(health.get("stale") or 0)
         if not s.get("vector_ready"):
             vector_line = "语义召回：没有向量（应用 /feiyu 向量 补建）"
-        elif covered >= active:
+        elif covered >= active and not stale:
             vector_line = f"语义召回：已覆盖 {covered}/{active} 条"
         else:
+            bits: list[str] = []
+            if covered < active:
+                bits.append(f"差 {s.get('vector_missing', 0)} 条")
+            if stale:
+                bits.append(f"{stale} 条型号或版本不符待重建")
             vector_line = (
                 f"语义召回：覆盖 {covered}/{active} 条"
-                f"（差 {s.get('vector_missing', 0)} 条，应用 /feiyu 向量 补建）"
+                f"（{'，'.join(bits)}，应用 /feiyu 向量"
+                f"{' 重建' if stale else ''} 补建）"
             )
-        return (
+        pending = 0
+        try:
+            pending = store.pending_proposal_count()
+        except Exception:
+            pass
+        text = (
             "记忆库：{}\n主人绑定：{} 个\n核心设定：{} 条\n"
             "可用记忆：{} 条（已被取代 {}，已删除 {}）\n"
             "证据：{} 条，向量：{} 条\n"
@@ -585,6 +631,9 @@ class FeiyuMemoryPlugin(Star):
             s.get("states", 0), s.get("diaries", 0), s.get("jobs_pending", 0),
             "开" if s["capture"] else "暂停",
         )
+        if pending:
+            text += f"\n待受理的整理提案：{pending} 个（/feiyu 整理 应用）"
+        return text
 
     def _profile_text(self, store: MemoryStore, ident: dict) -> list[str]:
         owner = ident["owner"] or {}
@@ -908,26 +957,40 @@ class FeiyuMemoryPlugin(Star):
 
     # -- 向量（可选） --------------------------------------------------- #
 
-    async def _ensure_embedding(self):
-        if self._embedding_checked:
+    async def _ensure_embedding(self, *, retry: bool = False):
+        """找宿主的嵌入服务商。
+
+        探到了就缓存到进程结束；**探不到不永久缓存**——主人随时可能去面板加一个，
+        所以留 60 秒冷却再自动重试（手动入口 retry=True 立刻重试）。
+        """
+        if self._embedding_checked and not retry:
             return self._embedding
-        self._embedding_checked = True
         if not self._cfg_bool("vector_search", True):
+            self._embedding_checked = True
             self._embedding_reason = "配置里关掉了向量检索"
             return None
+        if not retry and self._embedding_next_try > time.monotonic():
+            return self._embedding
         try:
             providers = self.context.get_all_embedding_providers() or []
             if providers:
                 self._embedding = providers[0]
+                self._embedding_checked = True
+                self._embedding_next_try = 0.0
+                self._embedding_reason = ""
                 logger.info("[feiyu-memory] 使用嵌入模型：%s", self._embedding.meta().id
                             if hasattr(self._embedding, "meta") else "unknown")
             else:
+                self._embedding_checked = False
+                self._embedding_next_try = time.monotonic() + 60.0
                 self._embedding_reason = "宿主没有配置嵌入模型"
                 logger.warning(
-                    "[feiyu-memory] 没有可用的嵌入模型：本轮及后续都只用关键词检索"
-                    "（要给语义召回，请在 AstrBot 里配置一个嵌入服务商）"
+                    "[feiyu-memory] 没有可用的嵌入模型：先用关键词检索；"
+                    "配好嵌入服务商后 60 秒内自动重试（或发 /feiyu 向量 立刻重试）"
                 )
         except Exception as exc:
+            self._embedding_checked = False
+            self._embedding_next_try = time.monotonic() + 60.0
             self._embedding_reason = f"取嵌入服务商失败：{exc}"
             logger.warning(
                 "[feiyu-memory] 无可用嵌入模型，退化为关键词检索：%s", exc
@@ -977,29 +1040,51 @@ class FeiyuMemoryPlugin(Star):
             store = self._safe_store()
             if store and vec:
                 await asyncio.to_thread(
-                    store.put_embedding, record_id, self._embedding_name(), vec
+                    store.put_embedding, record_id, self._embedding_name(), vec,
+                    version=self._embedding_version(),
                 )
         except Exception as exc:
             logger.debug("[feiyu-memory] 向量写入失败：%s", exc)
 
-    async def _backfill_vectors(self, limit: int = 40) -> dict:
-        """给还没向量的记录补嵌：向量通道是后开的，老记录不会自己长向量。"""
-        result = {"ok": False, "reason": "", "active": 0, "covered": 0, "filled": 0}
+    async def _backfill_vectors(self, limit: int = 40, *, rebuild: bool = False) -> dict:
+        """补向量：没向量的补上；rebuild=True 时型号/维度对不上的也重算。
+
+        向量通道是后开的，老记录不会自己长向量；换了嵌入模型之后旧向量也作废。
+        """
+        result = {"ok": False, "reason": "", "active": 0, "covered": 0,
+                  "filled": 0, "rebuilt": 0, "stale": 0, "pending": 0}
         store = self._safe_store()
         if store is None:
             result["reason"] = "记忆库没打开"
             return result
-        provider = await self._ensure_embedding()
+        provider = await self._ensure_embedding(retry=True)
         if provider is None:
             result["reason"] = self._embedding_reason or "没有可用的嵌入模型"
             return result
-        cov = await asyncio.to_thread(store.vector_coverage)
-        result.update({"active": cov["active"], "covered": cov["covered"]})
-        missing = await asyncio.to_thread(
-            store.list_missing_embeddings, limit=max(1, min(200, int(limit)))
-        )
         name = self._embedding_name()
-        for rec in missing:
+        version = self._embedding_version()
+        meta = {"model": name, "version": version}
+        cov = await asyncio.to_thread(store.vector_coverage)
+        health = await asyncio.to_thread(store.vector_health, meta)
+        result.update({"active": cov["active"], "covered": cov["covered"],
+                       "stale": health["stale"]})
+        cap = max(1, min(200, int(limit)))
+        missing = await asyncio.to_thread(store.list_missing_embeddings, limit=cap)
+        stale = []
+        if rebuild:
+            stale = await asyncio.to_thread(
+                store.list_stale_embeddings, meta, limit=cap
+            )
+        todo: list[dict] = []
+        seen: set[str] = set()
+        for rec in stale + missing:
+            rid = str(rec["id"])
+            if rid in seen:
+                continue
+            seen.add(rid)
+            todo.append(rec)
+        result["pending"] = len(todo)
+        for rec in todo:
             try:
                 vec = await provider.get_embedding(rec["content"][:500])
             except Exception as exc:
@@ -1008,12 +1093,17 @@ class FeiyuMemoryPlugin(Star):
             if not vec:
                 continue
             try:
-                await asyncio.to_thread(store.put_embedding, rec["id"], name, vec)
+                await asyncio.to_thread(
+                    store.put_embedding, rec["id"], name, vec, version=version
+                )
             except Exception as exc:
                 logger.debug("[feiyu-memory] 补嵌写入失败：%s", exc)
                 continue
-            result["filled"] += 1
-            result["covered"] += 1
+            if str(rec["id"]) in {str(s["id"]) for s in stale}:
+                result["rebuilt"] += 1
+            else:
+                result["filled"] += 1
+                result["covered"] += 1
         result["ok"] = True
         return result
 
@@ -1043,6 +1133,27 @@ class FeiyuMemoryPlugin(Star):
         except Exception:
             return "astrbot-embedding"
 
+    def _embedding_version(self) -> str:
+        """嵌入模型的版本标记；宿主没给就留空（空表示「不校验版本」）。"""
+        try:
+            meta = self._embedding.meta()
+        except Exception:
+            return ""
+        for attr in ("version", "model_version", "revision"):
+            value = getattr(meta, attr, "")
+            if value:
+                return str(value)[:40]
+        return ""
+
+    def _vector_meta(self, vector: list[float] | None) -> dict | None:
+        if not vector:
+            return None
+        return {
+            "model": self._embedding_name(),
+            "version": self._embedding_version(),
+            "dim": len(vector),
+        }
+
     # -- 配置读取 ------------------------------------------------------- #
 
     def _cfg_all(self) -> dict:
@@ -1051,6 +1162,7 @@ class FeiyuMemoryPlugin(Star):
             "core_max_chars": self._cfg_int("core_max_chars", 420),
             "max_recalled": self._cfg_int("max_recalled", 4),
             "min_score": self._cfg_float("min_score", 2.5),
+            "semantic_min": self._cfg_float("semantic_min", 0.30),
             "state_max_chars": self._cfg_int("state_max_chars", 200),
             "diary_max_chars": self._cfg_int("diary_max_chars", 240),
             "candidate_limit": self._cfg_int("candidate_limit", 2000),

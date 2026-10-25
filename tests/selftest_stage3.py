@@ -113,7 +113,7 @@ def test_helpers():
     print("[helpers] 证据定位与 JSON 解析")
     transcript = "主人：我从来不吃辣，火锅都点清汤\n助手：好"
     check(_evidence_supported("我从来不吃辣", transcript), "原文能定位")
-    check(_evidence_supported("我从来不吃辣火锅", transcript), "近义改写能定位")
+    check(not _evidence_supported("我从来不吃辣火锅", transcript), "改写不再冒充原文")
     check(not _evidence_supported("他喜欢爬山", transcript), "编造内容定位不到")
     check(parse_extraction("```json\n{\"memories\": []}\n```") == [], "带围栏空列表")
     check(parse_extraction("随便说点什么") == [], "非 JSON 返回空")
