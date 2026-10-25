@@ -9,11 +9,20 @@
 - 权限先于检索：先按场合与身份决定可见 scope，再做检索。
 - observed_dialogue 必须带证据，否则拒绝入库。
 - 删除写 tombstone + 全局 deletion_epoch，恢复备份不会复活已删除记录。
+
+检索层设计（2026-10 修订，吸收 private_companion 的三条做法）：
+- 权威表 memory_records 永远是唯一真相；memory_search（FTS5）是派生索引，
+  随时可 rebuild，且只用来「缩小候选」，可见性判断始终回到权威表重做一遍。
+- 候选不再按「重要性/时间」截断，而是按相关度截断；截断必须显式上报，
+  不允许「因为库变大，老记忆悄悄再也搜不到」。
+- 词项按 idf 加权：人人都有的话（主人/今天/什么）不再能单独把分数顶上去。
+- 排序后过一遍 MMR，避免四条召回说的是同一件事。
 """
 
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import sqlite3
@@ -24,7 +33,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # 项目根目录：优先环境变量 FEIYU_PROJECT_ROOT，否则用用户主目录下的 feiyu_memory/。
 # 实际部署请显式设置插件配置 db_path（或 FEIYU_MEMORY_DB），避免依赖默认值。
@@ -147,6 +156,34 @@ def compact(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[: max(0, limit - 1)].rstrip() + "…"
+
+
+def term_set(text: str) -> set[str]:
+    """检索词项集合：拉丁词 + 中文二元组，与 tokenize 同源。"""
+    latin, grams = tokenize(text)
+    return set(latin) | set(grams)
+
+
+def index_terms(text: str) -> list[str]:
+    return sorted(term_set(text))
+
+
+def text_similarity(a: str, b: str) -> float:
+    """分词后的 Jaccard 相似度；重复检测与 MMR 去重共用同一个口径。"""
+    sa, sb = term_set(a), term_set(b)
+    if not sa or not sb:
+        return 0.0
+    return len(sa & sb) / len(sa | sb)
+
+
+def fts_match_expr(terms) -> str:
+    """拼成 FTS5 的 OR 查询：任一命中即可，好坏交给 bm25 与本地打分。"""
+    parts = []
+    for term in terms:
+        term = (term or "").replace('"', '""')
+        if term:
+            parts.append(f'"{term}"')
+    return " OR ".join(parts)
 
 
 # --------------------------------------------------------------------------- #
@@ -341,14 +378,89 @@ class MemoryStore:
         with self._lock:
             self._conn.executescript(_SCHEMA)
             self._conn.commit()
+            self._ensure_search_table()
             cur = self._conn.execute("SELECT value FROM meta WHERE key='schema_version'")
             row = cur.fetchone()
-            if row is None:
+            current = 0
+            if row is not None:
+                try:
+                    current = int(row["value"])
+                except (TypeError, ValueError):
+                    current = 0
+            if current < SCHEMA_VERSION:
                 self._conn.execute(
                     "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)",
                     (str(SCHEMA_VERSION),),
                 )
                 self._conn.commit()
+
+    # -- 派生检索索引 -------------------------------------------------------- #
+
+    def _ensure_search_table(self) -> None:
+        """建 FTS5 派生索引；老版本 SQLite 没有 fts5 时安静降级为全表扫描。"""
+        try:
+            self._conn.execute(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS memory_search USING fts5("
+                "record_id UNINDEXED, kind UNINDEXED, grams, "
+                "tokenize = 'unicode61 remove_diacritics 2')"
+            )
+            self._conn.commit()
+            self._fts_ok = True
+        except sqlite3.Error:
+            self._fts_ok = False
+
+    def _index_tx(self, c, record_id: str, kind: str, content: str) -> None:
+        if not getattr(self, "_fts_ok", False):
+            return
+        try:
+            c.execute("DELETE FROM memory_search WHERE record_id=?", (record_id,))
+            c.execute(
+                "INSERT INTO memory_search(record_id, kind, grams) VALUES(?,?,?)",
+                (record_id, kind, " ".join(index_terms(content))),
+            )
+        except sqlite3.Error:
+            self._fts_ok = False
+
+    def _unindex_tx(self, c, record_id: str) -> None:
+        if not getattr(self, "_fts_ok", False):
+            return
+        try:
+            c.execute("DELETE FROM memory_search WHERE record_id=?", (record_id,))
+        except sqlite3.Error:
+            self._fts_ok = False
+
+    def rebuild_search_index(self) -> dict:
+        """从权威表整表重建派生索引。忘记/已取代的记录不会进索引。"""
+        if not getattr(self, "_fts_ok", False):
+            return {"ok": False, "indexed": 0, "reason": "fts5 不可用"}
+        with self._tx() as c:
+            c.execute("DELETE FROM memory_search")
+            rows = c.execute(
+                "SELECT id, kind, content FROM memory_records WHERE status='active'"
+            ).fetchall()
+            for row in rows:
+                self._index_tx(c, row["id"], row["kind"], row["content"])
+        self.audit("search_index_rebuild", actor="system",
+                   detail=f"{len(rows)} 条")
+        return {"ok": True, "indexed": len(rows)}
+
+    def _ensure_search_index(self) -> int:
+        """启动自检：索引条数与 active 记录数不一致就重建，避免「搜不到」变常态。"""
+        if not getattr(self, "_fts_ok", False):
+            return 0
+        try:
+            n_idx = self._conn.execute(
+                "SELECT COUNT(*) FROM memory_search"
+            ).fetchone()[0]
+            n_act = self._conn.execute(
+                "SELECT COUNT(*) FROM memory_records WHERE status='active'"
+            ).fetchone()[0]
+        except sqlite3.Error:
+            self._fts_ok = False
+            return 0
+        if int(n_idx) == int(n_act):
+            return 0
+        return int(self.rebuild_search_index().get("indexed") or 0)
 
     def _migrate(self) -> None:
         """轻量迁移：只加列/索引，不改动已有数据。"""
@@ -373,7 +485,124 @@ class MemoryStore:
                 "CREATE INDEX IF NOT EXISTS idx_jobs_status "
                 "ON memory_jobs(status, created_at)"
             )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_records_fact "
+                "ON memory_records(owner_id, fact_key, status)"
+            )
+            rec_cols = {
+                r["name"]
+                for r in self._conn.execute("PRAGMA table_info(memory_records)")
+            }
+            if "op_key" not in rec_cols:
+                # 写入幂等键：同一次提取/归纳重跑不会写第二条。
+                self._conn.execute(
+                    "ALTER TABLE memory_records "
+                    "ADD COLUMN op_key TEXT NOT NULL DEFAULT ''"
+                )
             self._conn.commit()
+        self._repair_single_value()
+        self._ensure_single_value_index()
+        self._repair_evidence_duplicates()
+        self._ensure_idempotency_index()
+        self._ensure_search_index()
+
+    def _repair_single_value(self) -> int:
+        """同一 (主人, fact_key, 范围) 有多条 active 时，只留最新一条。"""
+        fixed = 0
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT owner_id, fact_key, scope_type, scope_id, COUNT(*) AS n "
+                "FROM memory_records "
+                "WHERE status='active' AND fact_key<>'' "
+                "AND kind IN ('profile','preference','fact','relationship') "
+                "GROUP BY owner_id, fact_key, scope_type, scope_id "
+                "HAVING n > 1"
+            ).fetchall()
+            if not rows:
+                return 0
+            now = now_iso()
+            with self._tx() as c:
+                for row in rows:
+                    dup = c.execute(
+                        "SELECT id FROM memory_records WHERE owner_id=? AND fact_key=? "
+                        "AND scope_type=? AND scope_id=? AND status='active' "
+                        "ORDER BY asserted_at DESC, revision DESC",
+                        (row["owner_id"], row["fact_key"], row["scope_type"],
+                         row["scope_id"]),
+                    ).fetchall()
+                    for old in dup[1:]:
+                        c.execute(
+                            "UPDATE memory_records SET status=?, valid_to=?, "
+                            "updated_at=? WHERE id=?",
+                            (STATUS_SUPERSEDED, now, now, old["id"]),
+                        )
+                        self._unindex_tx(c, old["id"])
+                        fixed += 1
+        if fixed:
+            self.audit("single_value_repair", actor="system",
+                       detail=f"{fixed} 条重复单值记录已归档")
+        return fixed
+
+    def _ensure_single_value_index(self) -> bool:
+        """DB 层兜底：单值事实不可能同时 active 两条（唯一部分索引）。"""
+        try:
+            self._conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_records_single_value "
+                "ON memory_records(owner_id, fact_key, scope_type, scope_id) "
+                "WHERE status='active' AND fact_key<>'' "
+                "AND kind IN ('profile','preference','fact','relationship')"
+            )
+            self._conn.commit()
+            return True
+        except sqlite3.Error:
+            return False
+
+    def _repair_evidence_duplicates(self) -> int:
+        """同一条记录里 (kind, ref) 重复的证据只留最早一条。"""
+        removed = 0
+        try:
+            with self._tx() as c:
+                rows = c.execute(
+                    "SELECT record_id, kind, ref, COUNT(*) AS n, MIN(id) AS keep "
+                    "FROM memory_evidence WHERE ref<>'' "
+                    "GROUP BY record_id, kind, ref HAVING n > 1"
+                ).fetchall()
+                for row in rows:
+                    cur = c.execute(
+                        "DELETE FROM memory_evidence WHERE record_id=? AND kind=? "
+                        "AND ref=? AND id<>?",
+                        (row["record_id"], row["kind"], row["ref"], row["keep"]),
+                    )
+                    removed += max(0, cur.rowcount)
+        except sqlite3.Error:
+            return 0
+        if removed:
+            self.audit("evidence_dedupe", actor="system",
+                       detail=f"{removed} 条重复证据已删除")
+        return removed
+
+    def _ensure_idempotency_index(self) -> bool:
+        """写入幂等的 DB 兜底：同一个 op_key 只可能存在一条记录。"""
+        ok = True
+        try:
+            self._conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_records_op_key "
+                "ON memory_records(op_key) WHERE op_key<>''"
+            )
+        except sqlite3.Error:
+            ok = False
+        try:
+            self._conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_evidence_ref "
+                "ON memory_evidence(record_id, kind, ref) WHERE ref<>''"
+            )
+        except sqlite3.Error:
+            ok = False
+        try:
+            self._conn.commit()
+        except sqlite3.Error:
+            ok = False
+        return ok
 
     def audit(self, action: str, *, actor: str = "", record_id: str = "",
               detail: str = "") -> None:
@@ -603,6 +832,8 @@ class MemoryStore:
         platform: str = "",
         bot_instance: str = "",
         auto_supersede: bool = True,
+        supersede_epistemic: tuple[str, ...] | None = None,
+        op_key: str = "",
     ) -> dict:
         content = (content or "").strip()
         if not content:
@@ -640,21 +871,45 @@ class MemoryStore:
         now = now_iso()
         supersedes_id = None
         revision = 1
+        op_key = (op_key or "").strip()[:200]
+
+        if op_key:
+            # 幂等：同一次提取/归纳被重跑时，直接认回已经写过的那条，
+            # 不靠相似度去猜——相似度会把「今天吃了麻辣香锅」和
+            # 「今天吃了酸菜鱼」也判成同一条。
+            with self._lock:
+                dup = self._conn.execute(
+                    "SELECT id FROM memory_records WHERE op_key=? LIMIT 1", (op_key,)
+                ).fetchone()
+            if dup is not None:
+                existing = self.get_record(dup["id"])
+                if existing is not None:
+                    existing["_idempotent"] = True
+                    return existing
 
         with self._tx() as c:
             if fact_key and auto_supersede:
-                olds = c.execute(
+                sql = (
                     "SELECT id, revision FROM memory_records "
                     "WHERE owner_id=? AND fact_key=? AND scope_type=? AND scope_id=? "
-                    "AND status='active' ORDER BY asserted_at DESC LIMIT 1",
-                    (owner_id, fact_key, scope_type, scope_id),
-                ).fetchall()
+                    "AND status='active'"
+                )
+                params: list = [owner_id, fact_key, scope_type, scope_id]
+                if supersede_epistemic:
+                    # 归纳只允许取代同类来源，绝不覆盖主人亲口说过的话。
+                    sql += " AND epistemic_type IN (" + ",".join(
+                        "?" * len(supersede_epistemic)
+                    ) + ")"
+                    params.extend(supersede_epistemic)
+                sql += " ORDER BY asserted_at DESC LIMIT 1"
+                olds = c.execute(sql, params).fetchall()
                 for old in olds:
                     c.execute(
                         "UPDATE memory_records SET status=?, valid_to=?, updated_at=? "
                         "WHERE id=?",
                         (STATUS_SUPERSEDED, now, now, old["id"]),
                     )
+                    self._unindex_tx(c, old["id"])
                     supersedes_id = old["id"]
                     revision = int(old["revision"]) + 1
 
@@ -666,8 +921,8 @@ class MemoryStore:
                     derived_from_ids, occurred_at, asserted_at, valid_from, valid_to,
                     confidence, importance, status, expires_at, revision,
                     supersedes_id, deletion_epoch, persona_version, created_at,
-                    updated_at, created_by
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    updated_at, created_by, op_key
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     rid, owner_id, subject_id or owner_id, platform, bot_instance,
@@ -677,7 +932,7 @@ class MemoryStore:
                     occurred_at, asserted_at or now, valid_from, valid_to,
                     float(confidence), int(importance), STATUS_ACTIVE, expires_at,
                     revision, supersedes_id, self.deletion_epoch(), persona_version,
-                    now, now, created_by,
+                    now, now, created_by, op_key,
                 ),
             )
             for ev in evidence:
@@ -687,6 +942,7 @@ class MemoryStore:
                     (rid, str(ev.get("kind", "note")), str(ev.get("ref", "")),
                      str(ev.get("excerpt", ""))[:1000], now),
                 )
+            self._index_tx(c, rid, kind, content)
             row = c.execute(
                 "SELECT * FROM memory_records WHERE id=?", (rid,)
             ).fetchone()
@@ -755,6 +1011,122 @@ class MemoryStore:
             out.append(d)
         return out
 
+    def merge_records(self, keep_id: str, drop_ids: list[str], *,
+                      reason: str = "reflect_merge") -> int:
+        """把同义重复记录归档：保留 keep，其余置 superseded；证据并入 keep。
+
+        不产生新记录——整理阶段删重复时不该顺手改写内容。
+        """
+        drop_ids = [i for i in (drop_ids or []) if i and i != keep_id]
+        if not drop_ids:
+            return 0
+        now = now_iso()
+        merged = 0
+        with self._tx() as c:
+            keep = c.execute(
+                "SELECT id FROM memory_records WHERE id=?", (keep_id,)
+            ).fetchone()
+            if keep is None:
+                return 0
+            for rid in drop_ids:
+                for ev in c.execute(
+                    "SELECT kind, ref, excerpt FROM memory_evidence "
+                    "WHERE record_id=?",
+                    (rid,),
+                ).fetchall():
+                    c.execute(
+                        "INSERT OR IGNORE INTO memory_evidence("
+                        "record_id, kind, ref, excerpt, created_at) "
+                        "VALUES(?,?,?,?,?)",
+                        (keep_id, ev["kind"], ev["ref"], ev["excerpt"], now),
+                    )
+                cur = c.execute(
+                    "UPDATE memory_records SET status=?, valid_to=?, updated_at=? "
+                    "WHERE id=? AND status='active'",
+                    (STATUS_SUPERSEDED, now, now, rid),
+                )
+                if cur.rowcount:
+                    self._unindex_tx(c, rid)
+                    merged += 1
+        if merged:
+            self.audit(reason, actor="system", record_id=keep_id,
+                       detail=f"保留 1 条，归档 {merged} 条重复")
+        return merged
+
+    def find_similar(
+        self, owner_id: str, text: str, *, limit: int = 40,
+        status: str = STATUS_ACTIVE,
+    ) -> list[dict]:
+        """找同主人下与 text 相近的记录；用于写入前的重复检测。
+
+        以前是「取最近 200 条比一比」，库一变大就漏；现在先用派生索引找候选，
+        再逐条算相似度，规模不再决定漏检。
+        """
+        terms = index_terms(text or "")
+        if not terms:
+            return []
+        if not self._fts_ok:
+            # 没有 FTS5 的老 SQLite：退回最近 200 条粗筛，聊胜于无。
+            rows = self.list_records(owner_id=owner_id, status=status, limit=200)
+            out = []
+            for rec in rows:
+                rec = dict(rec)
+                rec["similarity"] = round(text_similarity(text, rec["content"]), 3)
+                out.append(rec)
+            out.sort(key=lambda r: r["similarity"], reverse=True)
+            return out
+        expr = fts_match_expr(terms)
+        try:
+            with self._lock:
+                rows = self._conn.execute(
+                    "SELECT record_id FROM memory_search "
+                    "WHERE memory_search MATCH ? ORDER BY bm25(memory_search) LIMIT ?",
+                    (expr, max(1, int(limit))),
+                ).fetchall()
+                ids = [r["record_id"] for r in rows]
+                out: list[dict] = []
+                for rid in ids:
+                    row = self._conn.execute(
+                        "SELECT * FROM memory_records WHERE id=? AND owner_id=? "
+                        "AND status=?",
+                        (rid, owner_id, status),
+                    ).fetchone()
+                    if not row:
+                        continue
+                    rec = dict(row)
+                    rec["similarity"] = round(text_similarity(text, rec["content"]), 3)
+                    out.append(rec)
+        except sqlite3.Error:
+            return []
+        out.sort(key=lambda r: r["similarity"], reverse=True)
+        return out
+
+    def find_active(
+        self, owner_id: str, *, kind: str | None = None,
+        fact_key: str | None = None, epistemic_type: str | None = None,
+        scope_type: str | None = None, limit: int = 10,
+    ) -> list[dict]:
+        """按条件精确查 active 记录；走索引，不再扫最近 N 条。"""
+        sql = "SELECT * FROM memory_records WHERE owner_id=? AND status='active'"
+        params: list = [owner_id]
+        if kind is not None:
+            sql += " AND kind=?"
+            params.append(kind)
+        if fact_key is not None:
+            sql += " AND fact_key=?"
+            params.append(fact_key)
+        if epistemic_type is not None:
+            sql += " AND epistemic_type=?"
+            params.append(epistemic_type)
+        if scope_type is not None:
+            sql += " AND scope_type=?"
+            params.append(scope_type)
+        sql += " ORDER BY asserted_at DESC LIMIT ?"
+        params.append(max(1, int(limit)))
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+
     def correct_record(
         self, record_id: str, new_content: str, *, actor: str = "owner"
     ) -> dict:
@@ -773,6 +1145,7 @@ class MemoryStore:
                 "UPDATE memory_records SET status=?, valid_to=?, updated_at=? WHERE id=?",
                 (STATUS_SUPERSEDED, now, now, record_id),
             )
+            self._unindex_tx(c, record_id)
             c.execute(
                 """
                 INSERT INTO memory_records(
@@ -797,6 +1170,7 @@ class MemoryStore:
                     now, now, actor,
                 ),
             )
+            self._index_tx(c, rid, old["kind"], new_content)
         self.audit("record_correct", actor=actor, record_id=rid,
                    detail=f"修正 {record_id}: {compact(new_content, 80)}")
         self.invalidate_derived(record_id, reason="源记录被纠正", actor=actor)
@@ -820,6 +1194,7 @@ class MemoryStore:
                 "WHERE id=?",
                 (STATUS_DELETED, epoch, now, record_id),
             )
+            self._unindex_tx(c, record_id)
             c.execute("DELETE FROM memory_embeddings WHERE record_id=?", (record_id,))
             c.execute(
                 "INSERT OR REPLACE INTO memory_tombstones("
@@ -841,6 +1216,7 @@ class MemoryStore:
                 "UPDATE memory_records SET status=?, updated_at=? WHERE id=?",
                 (STATUS_DONE, now_iso(), record_id),
             )
+            self._unindex_tx(c, record_id)
         self.audit("commitment_done", actor=actor, record_id=record_id)
         return True
 
@@ -1045,6 +1421,7 @@ class MemoryStore:
                         "WHERE id=?",
                         (STATUS_SUPERSEDED, now, now, rid),
                     )
+                    self._unindex_tx(c, rid)
         self.audit("state_expire", actor="system", detail=f"{len(ids)} 条工作状态到期归档")
         return len(ids)
 
@@ -1073,6 +1450,7 @@ class MemoryStore:
                         "WHERE id=?",
                         (STATUS_SUPERSEDED, now, now, rid),
                     )
+                    self._unindex_tx(c, rid)
         self.audit(
             "derived_invalidate", actor=actor, record_id=source_id,
             detail=f"源记录失效，连带 {len(ids)} 条派生记录：{reason}"[:500],
@@ -1101,6 +1479,37 @@ class MemoryStore:
         if not row:
             return None
         return list(struct.unpack(f"<{row['dim']}f", row["vector"]))
+
+    def list_missing_embeddings(self, *, owner_id: str | None = None,
+                                limit: int = 40) -> list[dict]:
+        """还没有向量的可用记录：用来补嵌历史（向量通道后开才有用）。"""
+        sql = (
+            "SELECT r.id, r.content, r.kind FROM memory_records r "
+            "LEFT JOIN memory_embeddings e ON e.record_id = r.id "
+            "WHERE r.status='active' AND e.record_id IS NULL"
+        )
+        params: list = []
+        if owner_id:
+            sql += " AND r.owner_id=?"
+            params.append(owner_id)
+        sql += " ORDER BY r.asserted_at DESC LIMIT ?"
+        params.append(max(1, int(limit)))
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def vector_coverage(self) -> dict:
+        """向量覆盖情况：可用记录里有多少条真的带向量。"""
+        with self._lock:
+            active = self._conn.execute(
+                "SELECT COUNT(*) FROM memory_records WHERE status='active'"
+            ).fetchone()[0]
+            covered = self._conn.execute(
+                "SELECT COUNT(*) FROM memory_records r "
+                "JOIN memory_embeddings e ON e.record_id=r.id "
+                "WHERE r.status='active'"
+            ).fetchone()[0]
+        return {"active": int(active), "covered": int(covered)}
 
     # -- 检索 ---------------------------------------------------------------- #
 
@@ -1141,21 +1550,136 @@ class MemoryStore:
             rows = self._conn.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
 
+    def _fetch_authorized(self, ids: list[str], owner_id: str,
+                          view: list[tuple[str, str]]) -> dict[str, dict]:
+        """按 id 回权威表重判可见性：索引说能看的，这里说了才算。"""
+        if not ids:
+            return {}
+        clauses = []
+        base: list = [owner_id, now_iso(), now_iso(), now_iso()]
+        for st, sid in view:
+            clauses.append("(scope_type=? AND scope_id=?)")
+            base.extend([st, sid])
+        out: dict[str, dict] = {}
+        with self._lock:
+            for start in range(0, len(ids), 400):
+                chunk = ids[start : start + 400]
+                sql = (
+                    "SELECT * FROM memory_records WHERE owner_id=? AND status='active' "
+                    "AND (expires_at IS NULL OR expires_at > ?) "
+                    "AND (valid_from IS NULL OR valid_from <= ?) "
+                    "AND (valid_to IS NULL OR valid_to > ?) "
+                    "AND (" + " OR ".join(clauses) + ") "
+                    "AND id IN (" + ",".join("?" * len(chunk)) + ")"
+                )
+                rows = self._conn.execute(sql, base + list(chunk)).fetchall()
+                for row in rows:
+                    out[row["id"]] = dict(row)
+        return out
+
+    def _fts_candidates(
+        self, owner_id: str, view: list[tuple[str, str]], terms: list[str],
+        limit: int,
+    ) -> tuple[list[dict], bool]:
+        """FTS5 缩小候选并按 bm25 排序；返回 (记录, 是否因上限被截断)。"""
+        expr = fts_match_expr(terms)
+        if not expr or not view:
+            return [], False
+        limit = max(1, int(limit))
+        try:
+            with self._lock:
+                rows = self._conn.execute(
+                    "SELECT record_id FROM memory_search "
+                    "WHERE memory_search MATCH ? ORDER BY bm25(memory_search) LIMIT ?",
+                    (expr, limit + 1),
+                ).fetchall()
+        except sqlite3.Error:
+            self._fts_ok = False
+            return [], False
+        ids = [r["record_id"] for r in rows]
+        truncated = len(ids) > limit
+        ids = ids[:limit]
+        authorized = self._fetch_authorized(ids, owner_id, view)
+        return [authorized[i] for i in ids if i in authorized], truncated
+
+    def _idf_weights(self, terms: list[str]) -> dict[str, float]:
+        """词项权重：出现得越多的话越不值钱；单字/二元组一视同仁。"""
+        if not self._fts_ok or not terms:
+            return {}
+        try:
+            with self._lock:
+                total = self._conn.execute(
+                    "SELECT COUNT(*) FROM memory_search"
+                ).fetchone()[0]
+        except sqlite3.Error:
+            return {}
+        total = int(total or 0)
+        if total <= 0:
+            return {}
+        idf_max = math.log(1.0 + (total - 1 + 0.5) / 1.5)
+        if idf_max <= 0:
+            return {}
+        weights: dict[str, float] = {}
+        for term in terms:
+            try:
+                with self._lock:
+                    df = self._conn.execute(
+                        "SELECT COUNT(*) FROM memory_search WHERE memory_search MATCH ?",
+                        (f'"{term.replace(chr(34), chr(34) * 2)}"',),
+                    ).fetchone()[0]
+            except sqlite3.Error:
+                return {}
+            df = max(0, int(df or 0))
+            idf = math.log(1.0 + (total - df + 0.5) / (df + 0.5))
+            weights[term] = max(0.15, min(1.0, idf / idf_max))
+        return weights
+
+    @staticmethod
+    def _mmr_select(scored: list[tuple[float, dict]], k: int,
+                    lambda_mult: float) -> list[tuple[float, dict]]:
+        """MMR：既相关又不重复。相似度用分词 Jaccard，不需要向量。"""
+        if not scored:
+            return []
+        top = max(s for s, _ in scored) or 1.0
+        lam = min(1.0, max(0.05, float(lambda_mult)))
+        pool = [
+            {"score": s, "rec": rec, "rel": s / top,
+             "terms": term_set(rec.get("content") or "")}
+            for s, rec in scored
+        ]
+        chosen: list[dict] = []
+        while pool and len(chosen) < k:
+            best_i, best_v = 0, None
+            for i, item in enumerate(pool):
+                sim = 0.0
+                for picked in chosen:
+                    inter = len(item["terms"] & picked["terms"])
+                    union = len(item["terms"] | picked["terms"])
+                    if union:
+                        sim = max(sim, inter / union)
+                value = lam * item["rel"] - (1.0 - lam) * sim
+                if best_v is None or value > best_v:
+                    best_i, best_v = i, value
+            chosen.append(pool.pop(best_i))
+        return [(c["score"], c["rec"]) for c in chosen]
+
     def _score(self, rec: dict, latin: set[str], grams: set[str], raw: str,
-               vector: list[float] | None) -> float:
+               vector: list[float] | None,
+               weights: dict[str, float] | None = None) -> float:
         text = (rec.get("content") or "").lower()
         if not text:
             return 0.0
+        w = weights or {}
         # 先算字面/语义证据；没有证据的记录不靠重要性和近因“蹭”进上下文。
         lexical = 0.0
         if raw and raw in text:
             lexical += 5.0
         for tok in latin:
             if tok in text:
-                lexical += 2.0
+                lexical += 2.0 * w.get(tok, 1.0)
         if grams:
-            hit = sum(1 for g in grams if g in text)
-            lexical += 7.0 * hit / len(grams)
+            num = sum(w.get(g, 1.0) for g in grams if g in text)
+            lexical += 7.0 * num / len(grams)
         if rec.get("fact_key") and raw:
             key = rec["fact_key"].lower().replace(".", " ")
             if any(tok in key for tok in latin) or any(g in key for g in grams):
@@ -1193,30 +1717,61 @@ class MemoryStore:
         user_id: str = "",
         limit: int = 4,
         min_score: float = 2.5,
-        candidate_limit: int = 400,
+        candidate_limit: int = 2000,
         vector: list[float] | None = None,
+        mmr: bool = True,
+        mmr_lambda: float = 0.7,
+        stats: dict | None = None,
     ) -> list[dict]:
+        stats = stats if stats is not None else {}
         query = (query or "").strip()
         if not query:
             return []
         view = self._scope_view(is_owner, scene, group_id, user_id)
-        cands = self._candidates(owner_id, view, candidate_limit)
+        if not view:
+            return []
         latin, grams = tokenize(query)
+        terms = index_terms(query)
+        truncated = False
+        if self._fts_ok and terms:
+            cands, truncated = self._fts_candidates(
+                owner_id, view, terms, candidate_limit
+            )
+        elif self._fts_ok:
+            cands = []  # 查询里全是虚词，没有可检索的证据
+        else:
+            cands = self._candidates(owner_id, view, candidate_limit)
+        weights = self._idf_weights(terms) if cands else {}
         raw = query.lower()
         scored = []
         for rec in cands:
             if rec.get("kind") == "state":
                 continue  # 工作状态走独立注入段，不再参与召回排序
-            s = self._score(rec, latin, grams, raw, vector)
+            s = self._score(rec, latin, grams, raw, vector, weights)
             if s >= min_score:
                 scored.append((s, rec))
         scored.sort(key=lambda x: (x[0], x[1].get("asserted_at") or ""), reverse=True)
+        top_k = max(1, int(limit))
+        if mmr and len(scored) > 1:
+            chosen = self._mmr_select(scored, top_k, mmr_lambda)
+        else:
+            chosen = scored[:top_k]
         out = []
-        for s, rec in scored[: max(1, limit)]:
+        for s, rec in chosen:
             rec = dict(rec)
             rec["_score"] = round(s, 3)
             rec["source_ids"] = json.loads(rec.get("source_ids") or "[]")
             out.append(rec)
+        stats.update(
+            {
+                "mode": "fts" if (self._fts_ok and terms) else "scan",
+                "candidates": len(cands),
+                "matched": len(scored),
+                "truncated": truncated,
+                "candidate_limit": int(candidate_limit),
+                "mmr": bool(mmr and len(scored) > 1),
+            }
+        )
         return out
 
     # -- 注入装配 ------------------------------------------------------------ #
@@ -1353,6 +1908,7 @@ class MemoryStore:
 
         # 检索部分
         recalled: list[dict] = []
+        search_stats: dict = {}
         if query:
             try:
                 recalled = self.search(
@@ -1364,10 +1920,21 @@ class MemoryStore:
                     user_id=user_id,
                     limit=max_recalled,
                     min_score=min_score,
+                    candidate_limit=int(cfg.get("candidate_limit", 2000)),
                     vector=vector,
+                    mmr=bool(cfg.get("mmr_enable", True)),
+                    mmr_lambda=float(cfg.get("mmr_lambda", 0.7)),
+                    stats=search_stats,
                 )
             except Exception:
                 recalled = []
+                search_stats = {"mode": "error"}
+        if search_stats.get("truncated"):
+            state_lines.insert(
+                len(state_lines) - 1,
+                f"- 本轮检索：相关候选超过 {search_stats.get('candidate_limit')} 条，"
+                "按相关度截取；更早的记忆可能没有进来",
+            )
 
         buckets: dict[str, list[str]] = {}
         order = ["preference", "profile", "fact", "event", "diary", "lore",
@@ -1436,6 +2003,7 @@ class MemoryStore:
             "state": "\n".join(state_lines),
             "memory": "\n".join(memory_lines),
             "recalled": recalled,
+            "search": search_stats,
             "is_owner": is_owner,
         }
 
@@ -1447,6 +2015,10 @@ class MemoryStore:
                 row = self._conn.execute(sql, params).fetchone()
                 return row[0] if row else 0
 
+            try:
+                index_rows = one("SELECT COUNT(*) FROM memory_search")
+            except sqlite3.Error:
+                index_rows = -1
             return {
                 "db_path": str(self.db_path),
                 "owners": one(
@@ -1475,6 +2047,27 @@ class MemoryStore:
                 ),
                 "jobs_pending": one(
                     "SELECT COUNT(*) FROM memory_jobs WHERE status='pending'"
+                ),
+                "index_ok": bool(getattr(self, "_fts_ok", False)),
+                "index_rows": index_rows,
+                "vector_ready": bool(
+                    one("SELECT COUNT(*) FROM memory_embeddings"
+                        " WHERE length(vector)>0")
+                ),
+                "covered": one(
+                    "SELECT COUNT(*) FROM memory_records r "
+                    "JOIN memory_embeddings e ON e.record_id=r.id "
+                    "WHERE r.status='active'"
+                ),
+                "vector_missing": one(
+                    "SELECT COUNT(*) FROM memory_records r "
+                    "LEFT JOIN memory_embeddings e ON e.record_id=r.id "
+                    "WHERE r.status='active' AND e.record_id IS NULL"
+                ),
+                "conflicts": one(
+                    "SELECT COUNT(*) FROM memory_audit "
+                    "WHERE action='extract_conflict' AND ts >= ?",
+                    (iso_days_ago(7),),
                 ),
                 "deletion_epoch": self.deletion_epoch(),
                 "capture": self.capture_enabled(),
@@ -1550,6 +2143,8 @@ class MemoryStore:
                 "VALUES('deletion_epoch', ?, ?)",
                 (str(max(epoch, self.deletion_epoch())), now_iso()),
             )
+        # 备份文件里的派生索引可能与墓碑重放后的状态不一致，整表重建一次。
+        self.rebuild_search_index()
         self.audit("restore", actor="cli",
                    detail=f"{source} tombstones={len(tombstones)} reapplied={reapplied}")
         return {"source": str(source), "tombstones": len(tombstones),
@@ -1596,7 +2191,8 @@ def _cosine(a: list[float], b: list[float]) -> float:
 
 
 __all__ = [
-    "MemoryStore", "MemoryError", "default_db_path", "tokenize",
+    "MemoryStore", "MemoryError", "default_db_path", "tokenize", "term_set",
+    "index_terms", "text_similarity", "fts_match_expr",
     "now_iso", "new_id", "KINDS", "EPISTEMIC_TYPES", "SCOPE_TYPES",
     "CORE_SECTIONS", "EPISTEMIC_TAG", "SCHEMA_VERSION",
 ]

@@ -6,8 +6,9 @@ desc: >
   聊天里自称"我是主人"无效。每轮先按场合与身份做权限过滤，再注入后端核验状态与
   记忆参考资料：主人私聊可见核心与私人档案，主人进群只带公开版，群友各自隔离。
   记录区分主人确认、带来源的实际对话、预设故事三类来历；忘记写入墓碑，恢复备份
-  不会复活。阶段一/二/三均已实现：工作状态带有效期、每天写一篇关系日记、
-  按批后台提取（代码侧校验证据，只写 observed_dialogue）。
+  不会复活。阶段一/二/三/四均已实现：工作状态带有效期、每天写一篇关系日记、
+  按批后台提取（代码侧校验证据，只写 observed_dialogue）、每天整理已有记忆
+  （删重复、归纳同主题，不改写主人原话），另外模型可以在需要时主动翻一次记忆。
 help: |
   /feiyu 状态 — 记忆库状态
   /feiyu 档案 — 核心设定与最近记录
@@ -15,8 +16,10 @@ help: |
   /feiyu 纠正 <编号> <新内容>；/feiyu 忘记 <编号>；/feiyu 撤销
   /feiyu 约定 <内容>；/feiyu 完成 <编号>；/feiyu 暂停 / 恢复
   /feiyu 当前 <在做什么>；/feiyu 日记；/feiyu 写日记；/feiyu 提取
+  /feiyu 整理 — 删重复、归纳同主题（不改主人原话）
+  /feiyu 向量 — 补语义向量；/feiyu 维护 — 重建检索索引
   以上仅私聊、仅已绑定主人可用。绑定与导入请用 tools/feiyu_memory_admin.py。
-version: v0.2.0
+version: v0.4.0
 author: 大肥鱼项目
 repo: https://github.com/Deepsleep-one/astrbot-plugin-feiyu-memory
 astrbot_version: ">=4.16,<5"

@@ -24,6 +24,7 @@ from .memory_core import (
     compact,
     now_dt,
     now_iso,
+    text_similarity,
     tokenize,
 )
 
@@ -93,13 +94,8 @@ def _norm(text: str) -> str:
 
 
 def _similar(a: str, b: str) -> float:
-    """用分词后的 Jaccard 粗判两句话是不是同一件事。"""
-    la, ga = tokenize(a)
-    lb, gb = tokenize(b)
-    sa, sb = set(la) | set(ga), set(lb) | set(gb)
-    if not sa or not sb:
-        return 0.0
-    return len(sa & sb) / len(sa | sb)
+    """两句话是不是同一件事：与库里检索/去重共用同一个口径。"""
+    return text_similarity(a, b)
 
 
 def _strip_fences(text: str) -> str:
@@ -337,6 +333,10 @@ class Stage3:
             if rec is None:
                 skipped += 1
                 continue
+            if rec.get("_idempotent"):
+                # 这一条之前就写过了（重跑/重复投递），不算新写。
+                skipped += 1
+                continue
             written += 1
         if written:
             self._bump_daily(written)
@@ -379,33 +379,36 @@ class Stage3:
             scope_hint == "public" and self._bool("allow_auto_public", False)
         ) else "owner_private"
 
-        existing = self.store.list_records(owner_id=owner_id, limit=200)
-        for rec in existing:
-            if rec["status"] != "active":
-                continue
+        # 重复检测：用派生索引找同主题候选，不再只看最近 200 条。
+        for rec in self.store.find_similar(owner_id, content, limit=40):
             if _norm(rec["content"]) == _norm(content):
                 raise MemoryError("与已有记录重复")
-            if _similar(rec["content"], content) >= 0.85:
+            if float(rec.get("similarity") or 0) >= 0.85:
                 raise MemoryError("与已有记录高度相似")
 
         fact_key = _sanitize_fact_key(str(cand.get("fact_key", "")))
         if kind == "state":
-            for rec in existing:
-                if (
-                    rec["status"] == "active"
-                    and rec["kind"] == "state"
-                    and rec["epistemic_type"] == "owner_asserted"
-                ):
-                    raise MemoryError("已有主人手动设定的当前状态，自动提取不覆盖")
+            if self.store.find_active(
+                owner_id, kind="state", epistemic_type="owner_asserted", limit=1
+            ):
+                raise MemoryError("已有主人手动设定的当前状态，自动提取不覆盖")
         if fact_key:
-            for rec in existing:
-                if (
-                    rec["status"] == "active"
-                    and rec["fact_key"] == fact_key
-                    and rec["epistemic_type"] == "owner_asserted"
-                ):
-                    # 主人明确说过的版本优先；自动提取不覆盖它。
-                    raise MemoryError("已有主人本人确认的同主题记录")
+            blockers = self.store.find_active(
+                owner_id, fact_key=fact_key, epistemic_type="owner_asserted", limit=3
+            )
+            if blockers:
+                # 主人明确说过的版本优先；自动提取不覆盖，但要留痕，不能静默丢。
+                self.store.audit(
+                    "extract_conflict",
+                    actor="extractor",
+                    record_id=blockers[0]["id"],
+                    detail=(
+                        f"fact_key={fact_key} 已有主人确认的说法："
+                        f"{compact(blockers[0]['content'], 60)}；本次候选丢弃："
+                        f"{compact(content, 60)}"
+                    ),
+                )
+                raise MemoryError("已有主人本人确认的同主题记录（已记为待确认冲突）")
 
         expires_at = None
         if kind == "state":
@@ -432,6 +435,11 @@ class Stage3:
                 "ref": f"job:{job['id']}",
                 "excerpt": evidence[:500],
             }],
+            # 幂等键：同一轮对话重跑（任务重试、批次重复投递）不会写第二条，
+            # 也不用靠 0.85 相似度去猜——那会把「吃了麻辣香锅」和「吃了酸菜鱼」判成同一条。
+            op_key="extract:" + hashlib.sha1(
+                f"{job['id']}|{kind}|{content}".encode("utf-8")
+            ).hexdigest()[:20],
         )
         if self.after_write is not None:
             try:

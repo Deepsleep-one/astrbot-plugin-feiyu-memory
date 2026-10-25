@@ -53,6 +53,24 @@
     "hint": "超时只丢旧记录，不丢主人身份；核心记忆会继续注入。默认 1200。",
     "default": 1200
   },
+  "candidate_limit": {
+    "type": "int",
+    "description": "每轮送入打分的候选上限",
+    "hint": "先由检索索引按相关度取前 N 条再精算，默认 2000。超过这个数会在注入里明写“候选被截断”，不会静默丢旧记忆。库很大时才需要调。",
+    "default": 2000
+  },
+  "mmr_enable": {
+    "type": "bool",
+    "description": "召回结果去重（MMR）",
+    "hint": "默认开。多条记忆说的是同一件事时，只留最相关的那条，把名额让给别的话题。",
+    "default": true
+  },
+  "mmr_lambda": {
+    "type": "float",
+    "description": "去重强度（0.05-1.0）",
+    "hint": "默认 0.7。越接近 1 越只看相关度（可能翻出好几条重复的），越小越追求话题分散。",
+    "default": 0.7
+  },
   "auto_capture_owner_private": {
     "type": "bool",
     "description": "主人私聊自然语言捕获",
@@ -74,7 +92,7 @@
   "vector_search": {
     "type": "bool",
     "description": "使用嵌入向量辅助检索",
-    "hint": "需要 AstrBot 里已配置嵌入模型；没配置会自动退化为中文关键词检索，不报错。",
+    "hint": "需要 AstrBot 里已配置嵌入模型；没配置会自动退化为关键词检索，并在注入里明确告知模型“本轮没有语义召回”（不再静默降级）。",
     "default": true
   },
   "state_max_chars": {
@@ -165,5 +183,83 @@
     "description": "写日记用的模型（可选）",
     "hint": "留空用当前对话模型。",
     "default": ""
+  },
+  "reflect_enable": {
+    "type": "bool",
+    "description": "记忆整理（阶段四）",
+    "hint": "每天回看已有记忆：删同义重复、把同主题的零散条目归纳成一句。不产生新事实，没有可整理的就什么都不做。默认开启。",
+    "default": true
+  },
+  "reflect_hour": {
+    "type": "int",
+    "description": "整理在几点之后跑",
+    "hint": "0–23，默认 4（凌晨）。当天已经整理过就不会再跑。",
+    "default": 4
+  },
+  "reflect_days": {
+    "type": "int",
+    "description": "整理回看最近几天",
+    "hint": "默认 30 天。范围太小整理不出规律，太大容易把无关的条目凑到一起。",
+    "default": 30
+  },
+  "reflect_batch": {
+    "type": "int",
+    "description": "每轮最多看多少条",
+    "hint": "默认 120。整理是按批看的，看不完的部分留到明天。",
+    "default": 120
+  },
+  "reflect_min_records": {
+    "type": "int",
+    "description": "少于多少条就不整理",
+    "hint": "默认 4。素材太少时整理没有意义，直接跳过。",
+    "default": 4
+  },
+  "reflect_min_fold": {
+    "type": "int",
+    "description": "同组至少几条才归纳",
+    "hint": "默认 2。说法相近的条目至少有这么多条，才交给模型合并成一句。",
+    "default": 2
+  },
+  "reflect_fold": {
+    "type": "float",
+    "description": "归到同一组的相似度下限",
+    "hint": "默认 0.45。低于它算不同话题，不会被合到一起；调太高就几乎不会归纳。",
+    "default": 0.45
+  },
+  "reflect_group_limit": {
+    "type": "int",
+    "description": "每组最多送几条给模型",
+    "hint": "默认 8。超出的留到下一轮。",
+    "default": 8
+  },
+  "reflect_dedupe": {
+    "type": "float",
+    "description": "判为重复的相似度阈值",
+    "hint": "默认 0.88。同一类别里相似度超过它才归档旧说法，不会合并「今天吃了麻辣香锅」和「今天吃了酸菜鱼」。",
+    "default": 0.88
+  },
+  "reflect_model": {
+    "type": "string",
+    "description": "整理用的模型（可选）",
+    "hint": "留空用当前对话模型。",
+    "default": ""
+  },
+  "recall_tool_enable": {
+    "type": "bool",
+    "description": "允许模型主动查记忆",
+    "hint": "开启后模型多一个 feiyu_recall 工具，每轮最多查一次，用来翻当前没注入的旧记忆。默认开启。",
+    "default": true
+  },
+  "recall_tool_limit": {
+    "type": "int",
+    "description": "工具每次返回几条",
+    "hint": "默认 4，最多 8。",
+    "default": 4
+  },
+  "recall_tool_min_score": {
+    "type": "float",
+    "description": "工具的检索分数线",
+    "hint": "默认 1.5，比自动注入（2.5）宽松一点：模型主动问，说明它觉得需要。",
+    "default": 1.5
   }
 }
