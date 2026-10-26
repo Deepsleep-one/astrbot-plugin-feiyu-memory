@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import re
 import time
@@ -34,6 +35,7 @@ from .memory_core import (
 )
 from .memory_reflect import MemoryReflector
 from .memory_stage3 import Stage3
+from .snapshot_cache import TurnSnapshots
 
 PLUGIN_NAME = "astrbot_plugin_feiyu_memory"
 
@@ -121,6 +123,38 @@ class FeiyuMemoryPlugin(Star):
                 self._store = None
 
     # ------------------------------------------------------------------ #
+    # P1：本轮快照 / 临时块（同一轮只取一次，动态内容不落历史）
+    # ------------------------------------------------------------------ #
+
+    def _snapshots(self) -> TurnSnapshots:
+        snap = getattr(self, "_snap", None)
+        if not isinstance(snap, TurnSnapshots):
+            snap = TurnSnapshots(
+                max_entries=16,
+                enabled=self._cfg_bool("snapshot_cache_enable", False),
+            )
+            self._snap = snap
+        else:
+            snap.enabled = self._cfg_bool("snapshot_cache_enable", False)
+        return snap
+
+    def _apply_blocks(self, req, blocks: str) -> None:
+        """把本轮动态块拼到系统提示上，并保证同一个 req 对象只拼一次。"""
+        self._snapshots().apply(req, blocks, self._persona())
+
+    def _apply_snapshot_once(self, event, req) -> bool:
+        """同一条消息的后续工具轮：复用本轮快照，不再检索第二次。"""
+        snap = self._snapshots()
+        if snap.already_applied(req):
+            return True
+        blocks = snap.reuse(event)
+        if blocks is None:
+            return False
+        snap.apply(req, blocks, self._persona())
+        logger.info("[feiyu-memory] 复用本轮快照：这一轮不再重新检索")
+        return True
+
+    # ------------------------------------------------------------------ #
     # LLM 请求注入
     # ------------------------------------------------------------------ #
 
@@ -130,6 +164,8 @@ class FeiyuMemoryPlugin(Star):
             return
         store = self._safe_store()
         if store is None:
+            return
+        if self._apply_snapshot_once(event, req):
             return
         try:
             ident = self._identity(event)
@@ -173,6 +209,7 @@ class FeiyuMemoryPlugin(Star):
                 cfg=self._cfg_all(),
                 degraded=degraded,
                 receipt=receipt,
+                include_time=self._cfg_bool("state_time_line", True),
             )
             try:
                 ctx = await asyncio.wait_for(
@@ -190,14 +227,8 @@ class FeiyuMemoryPlugin(Star):
             logger.exception("[feiyu-memory] 注入失败：%s", exc)
             return
 
-        persona = self._persona()
-        parts = []
-        if persona:
-            parts.append(persona)
-        if req.system_prompt:
-            parts.append(req.system_prompt)
-        parts.append(blocks)
-        req.system_prompt = "\n\n".join(parts)
+        self._snapshots().remember(event, blocks)
+        self._apply_blocks(req, blocks)
         logger.debug(
             "[feiyu-memory] 注入 owner=%s scene=%s recalled=%s",
             ctx["is_owner"], ident["scene"], len(ctx["recalled"]),
@@ -266,7 +297,7 @@ class FeiyuMemoryPlugin(Star):
         self._stage3 = Stage3(
             store,
             self.config,
-            self._llm_call,
+            functools.partial(self._llm_call, operation="stage3"),
             logger=logger,
             after_write=self._schedule_embedding,
         )
@@ -280,7 +311,7 @@ class FeiyuMemoryPlugin(Star):
             return None
         self._reflector = MemoryReflector(
             store,
-            self._llm_call,
+            functools.partial(self._llm_call, operation="reflect"),
             self.config,
             logger=logger,
             after_write=self._schedule_embedding,
@@ -288,7 +319,7 @@ class FeiyuMemoryPlugin(Star):
         return self._reflector
 
     async def _llm_call(self, system_prompt: str, user_prompt: str,
-                        model: str = "") -> str:
+                        model: str = "", *, operation: str = "generate") -> str:
         provider = None
         try:
             provider = await self.context.get_using_provider_async()
@@ -306,8 +337,91 @@ class FeiyuMemoryPlugin(Star):
         }
         if model:
             kwargs["model"] = model
-        resp = await provider.text_chat(**kwargs)
+        resp = await self._metered_text_chat(provider, kwargs, operation)
         return (getattr(resp, "completion_text", "") or "").strip()
+
+    # ---- Token 计量（默认关闭；计量出问题绝不打断记忆整理）----------------
+    def _token_meter(self):
+        """懒加载计量器：只有 token_meter_enable=true 时才建；建不起来就当没开。"""
+        cached = getattr(self, "_token_meter_singleton", None)
+        if cached is not None:
+            return cached or None
+        self._token_meter_singleton = False  # 先占位，失败不反复重试
+        if not self._cfg_bool("token_meter_enable", False):
+            return None
+        try:
+            import importlib
+            import os
+
+            lib = importlib.import_module(f"{__package__ or PLUGIN_NAME}.feiyu_usage")
+            try:
+                from astrbot.api.star import StarTools
+
+                data_dir = Path(StarTools.get_data_dir(PLUGIN_NAME))
+            except Exception:  # noqa: BLE001 - 拿不到宿主数据目录就退回约定路径
+                data_dir = Path("data") / "plugin_data" / PLUGIN_NAME
+            data_dir.mkdir(parents=True, exist_ok=True)
+            sidecar = data_dir / "token_usage.db"
+            key_path = data_dir / "token_pseudonym.key"
+            if not key_path.exists():
+                key_path.write_bytes(os.urandom(32))
+                try:
+                    key_path.chmod(0o600)
+                except OSError:
+                    pass
+            queue = lib.QueuedLedger(lib.LocalLedger(sidecar, lib.LedgerLimits()))
+            queue.start()
+            meter = lib.LogicalMeterV1(
+                queue, pseudonym_key=key_path.read_bytes(), enabled=True
+            )
+            logger.info("[feiyu-memory] token 计量已开启（只记元数据）：%s",
+                        sidecar.name)
+            self._token_meter_singleton = meter
+            return meter
+        except Exception as exc:  # noqa: BLE001 - 计量不该拖垮记忆整理
+            logger.warning("[feiyu-memory] token 计量没起来，按原样调用模型：%s",
+                           type(exc).__name__)
+            return None
+
+    async def _metered_text_chat(self, provider, call: dict,
+                                 operation: str = "generate"):
+        """包一层计量，但返回对象、异常、取消语义都与原来一致。"""
+        meter = self._token_meter()
+        if meter is None:
+            return await provider.text_chat(**call)
+        try:
+            import importlib
+
+            lib = importlib.import_module(f"{__package__ or PLUGIN_NAME}.feiyu_usage")
+            config = getattr(provider, "provider_config", None)
+            model = ""
+            getter = getattr(provider, "get_model", None)
+            if callable(getter):
+                model = str(getter() or "")
+            provider_key = ""
+            if isinstance(config, dict):
+                provider_key = str(config.get("id") or "")
+                if not model:
+                    model = str(config.get("model") or config.get("id") or "")
+            if not provider_key:
+                provider_key = model
+            # 供应商记录表只认固定枚举（feiyu_usage/record.py 的 SOURCES/OPERATIONS），
+            # 写错会被静默丢弃，所以这里按来源映射成它认的值，不自己发明。
+            source, op = {
+                "stage3": ("memory_extract", "extract"),
+                "reflect": ("memory_reflect", "reflect"),
+            }.get(operation, ("other", "generate"))
+            info = lib.CallInfoV1(
+                source=source,
+                operation=op,
+                provider_key=provider_key or "unknown",
+                model=model or "unknown",
+                api_mode="chat_nonstream",
+                codec="astrbot_reported_v1",
+            )
+        except Exception:  # noqa: BLE001 - 元数据拼不出来就退回原始调用
+            return await provider.text_chat(**call)
+        return await meter.call(lambda: provider.text_chat(**call), info)
 
     # ------------------------------------------------------------------ #
     # 聊天指令

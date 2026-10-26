@@ -2339,6 +2339,7 @@ class MemoryStore:
         degraded: str = "",
         receipt: str = "",
         extra: list[str] | None = None,
+        include_time: bool = True,
     ) -> dict:
         cfg = cfg or {}
         max_memory_chars = int(cfg.get("max_memory_chars", 1000))
@@ -2366,10 +2367,11 @@ class MemoryStore:
                 "- 说话者身份：未绑定的普通用户（不得使用主人专属称呼，"
                 "不得假设存在主人关系）"
             )
-        state_lines.append(
-            f"- 当前时间：{now_dt().strftime('%Y-%m-%d %H:%M')}"
-            f"（{'一二三四五六日'[now_dt().weekday()]}）"
-        )
+        if include_time:
+            state_lines.append(
+                f"- 当前时间：{now_dt().strftime('%Y-%m-%d %H:%M')}"
+                f"（{'一二三四五六日'[now_dt().weekday()]}）"
+            )
         if not is_owner:
             state_lines.append("- 记忆库：仅按当前场合的普通用户范围检索")
         elif not self.capture_enabled():

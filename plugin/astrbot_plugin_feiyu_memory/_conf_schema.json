@@ -267,5 +267,23 @@
     "description": "工具的检索分数线",
     "hint": "默认 1.5，比自动注入（2.5）宽松一点：模型主动问，说明它觉得需要。",
     "default": 1.5
+  },
+  "token_meter_enable": {
+    "type": "bool",
+    "description": "Token 用量计量（只记元数据）",
+    "hint": "默认关闭。开启后每次后台调用模型（提取、写日记、记忆整理）都会在插件数据目录写一条用量：只记 token 数、模型名、耗时和成败，绝不保存提示词或回复正文。计量出错只打日志，不影响记忆功能。改完需要重启 AstrBot 生效。",
+    "default": false
+  },
+  "snapshot_cache_enable": {
+    "type": "bool",
+    "description": "同一轮只检索一次（P1 本轮快照）",
+    "hint": "默认关闭。一条消息如果触发多轮工具调用，每一轮都会重新检索记忆、重新写一次回执；打开后同一轮复用第一次的结果，检索和向量调用只发生一次。关着与改动前逐字一致。",
+    "default": false
+  },
+  "state_time_line": {
+    "type": "bool",
+    "description": "在核验状态里写「当前时间」",
+    "hint": "默认开启。宿主自己也会把时间追加到这一轮的用户消息里（datetime_system_prompt），两条都在就是同一件事说两遍——重复的时间还会让前缀每轮都变、缓存更容易失效。确认宿主在提供时间后，可以关掉这一条。",
+    "default": true
   }
 }
